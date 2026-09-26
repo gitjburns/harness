@@ -729,25 +729,31 @@ impl App {
         }
 
         self.textarea.clear();
+        // Only the current turn's synthetic calls stay in context: remove every
+        // earlier call made only of `FYI()`/`help()` (synthetic or the model's own)
+        // before adding this turn's. The session file is the prompt, so they leave
+        // the file too.
+        self.session
+            .remove_calls(|call| code_of(call).is_ok_and(|code| is_exempt(&code)))?;
         // Save before terminal I/O so a terminal error can't lose the message.
         self.session.push(Message::user(text))?;
         let user_index = self.session.messages.len() - 1;
 
-        // Each turn opens with a synthetic `FYI()` call that the app makes as if the
-        // model had: a real REPL call (exempt from approval) whose result is the
-        // driver's snapshot. `advance` runs it, then sends the first request.
-        let call = fyi_call();
+        // Each turn opens with two synthetic calls that the app makes as if the model
+        // had: `FYI()` and `help()`, both exempt from approval. `advance` runs them,
+        // then sends the first request.
+        let calls = fyi_calls();
         let saved = self.session.push(Message {
             role: Role::Assistant,
             content: String::new(),
-            tool_calls: Some(vec![call.clone()]),
+            tool_calls: Some(calls.clone()),
             ..Default::default()
         });
-        // Queue the call before the save result is checked: the message is in the
-        // session either way, and an error exit must still record its result.
+        // Queue the calls before the save result is checked: the message is in the
+        // session either way, and an error exit must still record their results.
         self.turn = Some(Turn {
             phase: Phase::Idle,
-            queue: VecDeque::from([call]),
+            queue: calls.into(),
             repl: None,
         });
         saved?;
@@ -869,24 +875,28 @@ fn show_code(tui: &mut Tui, code: &str) -> io::Result<()> {
     tui.print(code.trim_end_matches('\n'), plain())
 }
 
-/// The synthetic `FYI(); help()` call opening each turn: the environment snapshot and
-/// the library listing. Ids only need to be unique within a session: the timestamp
-/// keeps them unique across `--resume`, the counter within one millisecond.
-fn fyi_call() -> ToolCall {
+/// The two synthetic calls opening each turn: `FYI()` for the environment
+/// snapshot and `help()` for the library listing. Ids only need to be unique within
+/// a session: the timestamp keeps them unique across `--resume`, the counter
+/// within one millisecond.
+fn fyi_calls() -> Vec<ToolCall> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    ToolCall {
-        id: format!(
-            "fyi-{}-{}",
-            chrono::Local::now().timestamp_millis(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ),
-        kind: "function".to_string(),
-        function: FunctionCall {
-            name: "REPL".to_string(),
-            arguments: r#"{"code": "FYI(); help()"}"#.to_string(),
-        },
-    }
+    ["FYI()", "help()"]
+        .into_iter()
+        .map(|code| ToolCall {
+            id: format!(
+                "fyi-{}-{}",
+                chrono::Local::now().timestamp_millis(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: "REPL".to_string(),
+                arguments: format!(r#"{{"code": "{code}"}}"#),
+            },
+        })
+        .collect()
 }
 
 /// Calls that never need approval in any mode: code made only of the driver's

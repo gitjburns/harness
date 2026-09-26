@@ -1,7 +1,8 @@
 //! Session file: `{ "messages": [...] }`, where `messages` is exactly the array sent
 //! to the endpoint. Messages are appended, except that resume inserts results for
-//! unanswered tool calls. Partial replies are kept as-is, except that a tool call
-//! still streaming when the reply ended is dropped.
+//! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
+//! (`remove_calls`). Partial replies are kept as-is, except that a tool call still
+//! streaming when the reply ended is dropped.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -155,6 +156,46 @@ impl Session {
     pub fn push(&mut self, message: Message) -> anyhow::Result<()> {
         self.messages.push(message);
         self.save()
+    }
+
+    /// Remove every tool call matching `matches`, with its tool result, and save if
+    /// anything changed. An assistant message left with no calls, content, or
+    /// reasoning is removed too; one that still has any of them stays without the
+    /// call. Returns how many calls were removed.
+    pub fn remove_calls(&mut self, matches: impl Fn(&ToolCall) -> bool) -> anyhow::Result<usize> {
+        let mut removed_ids = HashSet::new();
+        let mut emptied = vec![false; self.messages.len()];
+        for (message, emptied) in self.messages.iter_mut().zip(&mut emptied) {
+            let Some(calls) = &mut message.tool_calls else {
+                continue;
+            };
+            calls.retain(|call| {
+                let remove = matches(call);
+                if remove {
+                    removed_ids.insert(call.id.clone());
+                }
+                !remove
+            });
+            if calls.is_empty() {
+                message.tool_calls = None;
+                *emptied = message.content.is_empty() && message.reasoning.is_none();
+            }
+        }
+        if removed_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut emptied = emptied.into_iter();
+        self.messages.retain(|message| {
+            let emptied = emptied.next().unwrap_or(false);
+            let orphaned_result = message.role == Role::Tool
+                && message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| removed_ids.contains(id));
+            !emptied && !orphaned_result
+        });
+        self.save()?;
+        Ok(removed_ids.len())
     }
 
     /// Write via a synced temp file and rename so a crash or power loss never leaves a

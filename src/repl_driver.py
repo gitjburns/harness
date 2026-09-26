@@ -107,6 +107,7 @@ def help(obj=_missing):
     if obj is not _missing:
         return builtins.help(obj)
     print(
+        f"help()\n"
         f"Output limit: the output of each call returned to you is truncated to "
         f"{OUTPUT_LIMIT:,} bytes. Keep large data in variables or files rather than "
         f"printing it."
@@ -138,7 +139,7 @@ def _fyi():
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
     date = time.strftime("%a %b %d %H:%M:%S ", now) + offset + time.strftime(" %Y", now)
     tokens = "n/a" if prompt_tokens is None else prompt_tokens
-    print(f"Date: {date}\nPrompt tokens: {tokens}\nModel: {MODEL}")
+    print(f"FYI()\nDate: {date}\nPrompt tokens: {tokens}\nModel: {MODEL}")
 
 
 namespace["FYI"] = _fyi
