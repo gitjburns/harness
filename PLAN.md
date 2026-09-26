@@ -27,15 +27,18 @@ Decided against:
 
 ## Next
 
-1. **Sandbox.** OS-enforced containment of the REPL: Seatbelt (`sandbox-exec`) on macOS, Landlock (+ seccomp) or bubblewrap on Linux. Writes limited to the repo, no network; privileged operations via app-brokered functions that ask the user.
-2. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
-3. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
-4. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
+1. **App-managed scrollback.** Replace terminal-owned scrollback with an app-rendered, word-wrapped transcript view, so the transcript always matches what the model sees.
+2. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call. Depends on 1.
+3. **Sandbox.** OS-enforced containment of the REPL: Seatbelt (`sandbox-exec`) on macOS, Landlock (+ seccomp) or bubblewrap on Linux. Writes limited to the repo, no network; privileged operations via app-brokered functions that ask the user.
+4. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
+5. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
+6. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
 
 ## Open
 
 - Two instances started in the same second share a session file name and overwrite each other.
 - Process-group kill uses `/bin/kill` to avoid a direct `libc` dependency.
+- `SPEC.md` exempts synthetic calls from approval; the code still exempts `FYI()`/`help()`-only code and is updated with AGENTS.md.
 
 ## Reference
 
