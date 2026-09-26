@@ -17,11 +17,13 @@ Working log. Behavior contract: `SPEC.md`.
 11. **Approval exemption.** Code made only of `FYI()` and `help()` statements never needs approval.
 12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling.
 13. **Synthetic-call cleanup.** Each turn removes all earlier `FYI()`/`help()`-only calls (and results, and emptied assistant messages) from the session before adding its own, so exactly one of each is in context. First case of the app removing messages.
+14. **Chat system message.** Optional `[chat] prompt`, prepended to each chat request at send time and never saved, so the current config applies to resumed sessions.
 
 Decided against:
 - App-side word wrap of the transcript (it would break terminal reflow and copy).
 - Audit-hook gating as the first permission layer (classifier chosen instead).
 - A driver → app callback for `FYI()` (Python must not call Rust).
+- Saving the system message in the session (config edits wouldn't reach resumed sessions).
 
 ## Next
 

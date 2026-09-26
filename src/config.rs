@@ -14,6 +14,8 @@ const DEFAULT_OUTPUT_LIMIT: usize = 100_000;
 #[serde(deny_unknown_fields)]
 struct Config {
     endpoint: Endpoint,
+    #[serde(default)]
+    chat: Chat,
     classifier: Classifier,
     #[serde(default)]
     repl: Repl,
@@ -28,6 +30,14 @@ struct Endpoint {
     /// Name of the environment variable holding the API key. Omitted means the
     /// request is sent without an `Authorization` header.
     api_key_env: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Chat {
+    /// System message sent ahead of the conversation in every chat request, never
+    /// saved to the session. Omitted means no system message.
+    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +99,7 @@ pub struct ResolvedEndpoint {
 
 pub struct Settings {
     pub endpoint: ResolvedEndpoint,
+    pub chat_prompt: Option<String>,
     pub classifier_prompt: String,
     pub approval_mode: ApprovalMode,
     pub output_limit: usize,
@@ -133,6 +144,7 @@ pub fn load() -> anyhow::Result<Settings> {
             model: endpoint.model,
             api_key,
         },
+        chat_prompt: config.chat.prompt,
         classifier_prompt: config.classifier.prompt,
         approval_mode: config.repl.approval_mode,
         output_limit: config.repl.output_limit.unwrap_or(DEFAULT_OUTPUT_LIMIT),

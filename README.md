@@ -18,6 +18,11 @@ base_url = "http://localhost:8000/v1"
 model = "your-model-name"
 api_key_env = "OPENAI_API_KEY"   # optional; omit for servers that need no key
 
+[chat]                           # optional
+prompt = """
+...system message sent at the start of every request...
+"""
+
 [classifier]
 prompt = """
 ...instructions for judging whether code is safe to run; see this repo's config.toml...
@@ -110,7 +115,7 @@ def word_count(path):
 
 ## Conversation files
 
-Session files hold the conversation exactly as it is sent to the model, including tool calls and their results:
+Session files hold the conversation exactly as it is sent to the model, including tool calls and their results. The `[chat] prompt` system message isn't saved; each request uses the one currently in `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [

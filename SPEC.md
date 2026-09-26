@@ -13,6 +13,9 @@ All paths are relative to the working directory.
   model = "DeepSeek-V4-Flash-0731"
   api_key_env = "OPENAI_API_KEY"     # optional: names the variable holding the key; omitted = no Authorization header
 
+  [chat]                             # optional
+  prompt = """..."""                 # chat system message; omitted = none
+
   [classifier]
   prompt = """..."""                 # required: classifier system prompt
 
@@ -27,7 +30,7 @@ All paths are relative to the working directory.
 
 ## Messages
 
-- `messages` is exactly the array sent to the endpoint. No system prompt.
+- `messages` is exactly the array sent to the endpoint, after the system message. The system message is `[chat] prompt` as currently configured, added at send time and never saved.
   - user: `{"role": "user", "content"}`
   - assistant: `{"role": "assistant", "content", "reasoning"?, "tool_calls"?}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`
   - tool: `{"role": "tool", "tool_call_id", "content"}`
@@ -39,7 +42,7 @@ All paths are relative to the working directory.
 
 ## Requests
 
-- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured.
+- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured. `messages` starts with `{"role": "system", "content": [chat] prompt}` when configured.
 - SSE `data:` lines: `delta.reasoning` is reasoning, `delta.content` is content, `delta.tool_calls` are tool call fragments (by `index`; `id` and `function.name` once, `function.arguments` appended), `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
 - Classifier: non-streaming request to the same endpoint and model. System message: `[classifier] prompt`. User message: `Repository root: <absolute working directory>` and the code in a fenced block. `response_format` is a strict JSON schema `{"effects": string, "verdict": "safe" | "unsafe" | "inconclusive"}`, both required, in that order.
 

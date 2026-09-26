@@ -219,8 +219,12 @@ impl App {
     }
 
     fn start_request(&mut self) {
-        let (task, events) =
-            client::start(&self.http, &self.settings.endpoint, &self.session.messages);
+        let (task, events) = client::start(
+            &self.http,
+            &self.settings.endpoint,
+            self.settings.chat_prompt.as_deref(),
+            &self.session.messages,
+        );
         if let Some(turn) = self.turn.as_mut() {
             turn.phase = Phase::Streaming(Reply {
                 task,

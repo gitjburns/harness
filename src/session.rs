@@ -1,5 +1,6 @@
 //! Session file: `{ "messages": [...] }`, where `messages` is exactly the array sent
-//! to the endpoint. Messages are appended, except that resume inserts results for
+//! to the endpoint after the configured system message, which is never saved.
+//! Messages are appended, except that resume inserts results for
 //! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
 //! (`remove_calls`). Partial replies are kept as-is, except that a tool call still
 //! streaming when the reply ended is dropped.
