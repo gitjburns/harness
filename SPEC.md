@@ -38,7 +38,7 @@ All paths are relative to the working directory.
 - Every tool call in a saved assistant message is followed by exactly one tool message before the next request.
 - Messages are only removed by the per-turn `FYI()`/`help()` cleanup (see Tool calling).
 - Errors and classifier verdicts are shown in the transcript and never saved.
-- `--resume <PATH>` loads the file, prints the whole conversation, and appends to the same file. A missing or unparseable file is an error before the TUI starts. Any tool call without a result gets `[not run: turn stopped]`, inserted after its call's existing results and saved at once, with a line printed before the TUI starts.
+- `--resume <PATH>` loads the file, shows the whole conversation, and appends to the same file. A missing or unparseable file is an error before the TUI starts. Any tool call without a result gets `[not run: turn stopped]`, inserted after its call's existing results and saved at once, with a line printed to the normal screen before the TUI starts (visible after exit).
 
 ## Requests
 
@@ -74,18 +74,20 @@ All paths are relative to the working directory.
 
 ## Terminal UI
 
-- No alternate screen and no mouse capture. The terminal owns scrolling, selection, copy, and reflow.
-- The transcript is printed raw into scrollback and never hard-wrapped by the app. Control characters other than tab are stripped.
+- Full screen on the alternate screen, with mouse capture. On exit the terminal returns to its previous contents; nothing is left behind.
+- The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are.
+  - System message (if configured): `system` (dim), then the prompt.
   - User message: `> text`, cyan.
   - Assistant: reasoning dim, a blank line, then content in the default style.
-  - Tool call: `REPL` (dim), the code, the verdict line (`safe:` green, `unsafe:` red, `inconclusive:` or `classifier failed:` yellow; `auto` only), then the output, dim, streamed live and in full.
-  - A blank line follows each message and each tool call. Errors print red as `error: ...`.
-  - On resume, tool results print under their calls; verdict lines aren't shown. The whole replay is written in one write with one cursor query, so it appears at once: the end fills the screen and the rest is in scrollback (up to the terminal's scrollback limit).
-- Streaming: the unterminated last line is reprinted from its start on each update. A line taller than half the screen is committed with a hard break.
-- Each frame (transcript output plus region redraw) is one synchronized update.
-- Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line.
-- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage), then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, and ` · <notice>` in yellow until the next key press.
-- The hardware cursor is hidden and parked at the region's top-left cell. After a resize, its row is the region's new top and the region is redrawn.
+  - Tool call: `REPL` (dim), the code, the verdict note, then the result, dim. A saved reply's calls all appear at once; running output appears live, in full.
+  - A blank line follows each message and each tool call.
+  - Notes are shown but never saved and are lost on exit: verdicts (`safe:` green, `unsafe:` red, `inconclusive:` or `classifier failed:` yellow; `auto` only) under their call, and errors (`error: ...`, red) where they happened. A verdict goes with its call when the call is removed; errors keep their place among the remaining messages.
+- Word-wrapped by the app to the screen width and re-wrapped on resize. Rows break after whitespace; longer words break at the width. Tabs expand to 8-column stops; other control characters are not drawn.
+- Scrolling: while at the bottom the view follows new output; scrolled up, it stays on the same text as output arrives or the width changes, until scrolled back to the bottom. Sending a message returns to the bottom.
+- Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
+- Each frame is one synchronized update.
+- Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line. A click there only clears the selection.
+- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage), then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
 ## Keys
@@ -98,7 +100,10 @@ All paths are relative to the working directory.
 | ^U | Delete to start of line; at start of line, join the previous line |
 | Esc | Stop the turn |
 | Shift+Tab | Cycle approval mode: ask → auto → allow |
-| y / n | Answer an approval prompt (other keys are ignored while it shows) |
+| y / n | Answer an approval prompt (while it shows, only y, n, Esc, Shift+Tab, PageUp/PageDown, and the mouse act) |
+| PageUp / PageDown | Scroll the transcript a screen, less two rows |
+| Mouse wheel | Scroll the transcript one row |
+| Mouse drag | Select transcript text; copied on release |
 | ^C, ^D | Nothing |
 | Others | ratatui-textarea defaults |
 
@@ -115,7 +120,8 @@ All paths are relative to the working directory.
 |---|---|
 | `src/main.rs` | Arguments, config and session loading |
 | `src/app.rs` | Event loop, turn state machine, streaming display, saving, status line |
-| `src/tui.rs` | Scrollback printing, input region, resize, synchronized updates |
+| `src/tui.rs` | Alternate screen, mouse capture, screen layout, synchronized updates, clipboard |
+| `src/transcript.rs` | Transcript view: word wrap, scrolling, selection |
 | `src/input.rs` | Textarea setup, key map, paste |
 | `src/client.rs` | REPL tool definition, streaming request and SSE parsing, classifier request |
 | `src/repl.rs` | REPL process lifecycle and protocol |

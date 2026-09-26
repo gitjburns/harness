@@ -162,8 +162,11 @@ impl Session {
     /// Remove every tool call matching `matches`, with its tool result, and save if
     /// anything changed. An assistant message left with no calls, content, or
     /// reasoning is removed too; one that still has any of them stays without the
-    /// call. Returns how many calls were removed.
-    pub fn remove_calls(&mut self, matches: impl Fn(&ToolCall) -> bool) -> anyhow::Result<usize> {
+    /// call. Returns the pre-removal indices of the removed messages, ascending.
+    pub fn remove_calls(
+        &mut self,
+        matches: impl Fn(&ToolCall) -> bool,
+    ) -> anyhow::Result<Vec<usize>> {
         let mut removed_ids = HashSet::new();
         let mut emptied = vec![false; self.messages.len()];
         for (message, emptied) in self.messages.iter_mut().zip(&mut emptied) {
@@ -183,8 +186,10 @@ impl Session {
             }
         }
         if removed_ids.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
+        let mut removed = Vec::new();
+        let mut index = 0;
         let mut emptied = emptied.into_iter();
         self.messages.retain(|message| {
             let emptied = emptied.next().unwrap_or(false);
@@ -193,10 +198,15 @@ impl Session {
                     .tool_call_id
                     .as_ref()
                     .is_some_and(|id| removed_ids.contains(id));
-            !emptied && !orphaned_result
+            let keep = !emptied && !orphaned_result;
+            if !keep {
+                removed.push(index);
+            }
+            index += 1;
+            keep
         });
         self.save()?;
-        Ok(removed_ids.len())
+        Ok(removed)
     }
 
     /// Write via a synced temp file and rename so a crash or power loss never leaves a

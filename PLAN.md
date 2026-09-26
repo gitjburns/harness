@@ -18,21 +18,20 @@ Working log. Behavior contract: `SPEC.md`.
 12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling.
 13. **Synthetic-call cleanup.** Each turn removes all earlier `FYI()`/`help()`-only calls (and results, and emptied assistant messages) from the session before adding its own, so exactly one of each is in context. First case of the app removing messages.
 14. **Chat system message.** Optional `[chat] prompt`, prepended to each chat request at send time and never saved, so the current config applies to resumed sessions.
+15. **App-managed scrollback.** Alternate screen with mouse capture; the transcript is drawn each frame from the system message, messages, the turn in progress, and display-only notes, so it always matches the model's context. App word wrap, scrolling (follow at bottom, PageUp/PageDown, wheel), drag selection with OSC 52 copy on release.
 
 Decided against:
-- App-side word wrap of the transcript (it would break terminal reflow and copy).
 - Audit-hook gating as the first permission layer (classifier chosen instead).
 - A driver → app callback for `FYI()` (Python must not call Rust).
 - Saving the system message in the session (config edits wouldn't reach resumed sessions).
 
 ## Next
 
-1. **App-managed scrollback.** Replace terminal-owned scrollback with an app-rendered, word-wrapped transcript view, so the transcript always matches what the model sees.
-2. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call. Depends on 1.
-3. **Sandbox.** OS-enforced containment of the REPL: Seatbelt (`sandbox-exec`) on macOS, Landlock (+ seccomp) or bubblewrap on Linux. Writes limited to the repo, no network; privileged operations via app-brokered functions that ask the user.
-4. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
-5. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
-6. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
+1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
+2. **Sandbox.** OS-enforced containment of the REPL: Seatbelt (`sandbox-exec`) on macOS, Landlock (+ seccomp) or bubblewrap on Linux. Writes limited to the repo, no network; privileged operations via app-brokered functions that ask the user.
+3. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
+4. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
+5. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
 
 ## Open
 
@@ -45,6 +44,5 @@ Decided against:
 - Run: `cargo run` from the repo root; `cargo run -- --resume sessions/<file>.json`.
 - Endpoint: vLLM 0.30.0 at `http://10.1.0.10:8000/v1`, model `DeepSeek-V4-Flash-0731`, `max_model_len` 550000, no API key.
 - The model's chat template renders assistant `reasoning` only after the last user message (checked with `/tokenize`). `reasoning_content` is ignored on input.
-- crossterm's `EventStream` can't be used: it holds the input lock while waiting, which blocks `cursor::position()`.
 - The endpoint accepts tool calls with truncated (invalid JSON) `arguments`; other endpoints may not, hence dropping them.
 - Python audit hooks (PEP 578) report `open`, `os.remove`/`rename`, `subprocess.Popen`, `os.system`, `socket.connect`, `ctypes.*`, and `import` events with real arguments; not a security boundary.

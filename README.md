@@ -2,7 +2,7 @@
 
 A terminal coding agent for OpenAI-compatible chat completions endpoints. The model works through a single tool, a Python REPL, so it can read, write, and edit files, run commands, and combine them in ordinary code.
 
-Conversations print into your terminal's normal scrollback, so scrolling, selecting, copying, and resizing work as they do everywhere else in your terminal. Replies stream as they are generated, including the model's reasoning when the server provides it.
+The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
 > **The REPL runs Python on your machine, as you, with no sandbox.** Approval modes (below) control what runs without asking you.
 
@@ -53,7 +53,7 @@ Each run starts a new conversation, saved to `sessions/YYYYMMDD-HHMMSS.json` whe
 cargo run -- --resume sessions/20260925-143012.json
 ```
 
-The earlier conversation is printed, and new messages are added to the same file.
+The earlier conversation is shown, and new messages are added to the same file.
 
 ## Using it
 
@@ -88,8 +88,13 @@ Shift+Tab cycles the mode; the choice is saved to `config.toml`.
 | Esc | Stop the model |
 | Shift+Tab | Change approval mode |
 | y / n | Allow or deny a REPL call when asked |
+| PageUp / PageDown | Scroll the conversation a screen |
+| Mouse wheel | Scroll the conversation a line |
+| Mouse drag | Select text; it's copied when you release |
 
 Pasting multi-line text never sends it; press Enter when ready.
+
+When you scroll up, the view stays put while the model writes; scroll back to the bottom to follow it again. Copying uses the OSC 52 escape sequence, which some terminals don't support or need enabled (in iTerm2, allow clipboard access in settings; in tmux, set `set-clipboard on`). Where it doesn't work, your terminal's own selection still does, usually by holding Option (macOS) or Shift while dragging.
 
 ### Commands
 

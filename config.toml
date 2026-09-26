@@ -36,4 +36,4 @@ Forbidden (unsafe):
 """
 
 [repl]
-approval_mode = "auto"
+approval_mode = "ask"

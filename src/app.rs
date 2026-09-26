@@ -3,13 +3,16 @@
 //! A turn starts with a user message and alternates between streaming a response and
 //! handling its tool calls (classify or ask, then run in the turn's REPL). It ends
 //! when a response has no tool calls, on Esc, or on a stream error.
+//!
+//! The screen is drawn from state every frame (`build_blocks`): the session's
+//! messages, the turn in progress, and display-only notes. Handlers only change
+//! state; drawing is the loop's job.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::style::{ContentStyle, Stylize};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui_textarea::TextArea;
@@ -23,6 +26,7 @@ use crate::config::{self, ApprovalMode, Settings};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall};
+use crate::transcript::{Block, Key, View};
 use crate::tui::{self, Tui};
 
 const STOPPED: &str = "[stopped by user]";
@@ -36,6 +40,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         session,
         http: reqwest::Client::new(),
         textarea: input::new_textarea(),
+        view: View::default(),
+        notes: Vec::new(),
         turn: None,
         notice: None,
         context_tokens: None,
@@ -58,6 +64,9 @@ struct App {
     session: Session,
     http: reqwest::Client,
     textarea: TextArea<'static>,
+    view: View,
+    /// Display-only lines (verdicts, errors), never saved.
+    notes: Vec<Note>,
     turn: Option<Turn>,
     /// UI-only message shown in the status line until the next key press.
     notice: Option<String>,
@@ -68,7 +77,8 @@ struct App {
     /// Prompt tokens of the last reply, sent to the model as the next turn's FYI
     /// snapshot. Lags one turn behind; the first turn has no measurement yet.
     prompt_tokens: Option<u64>,
-    /// Exiting because of a signal: skip terminal output during cleanup.
+    /// Exiting because of a signal: the terminal may be gone, so a failure to
+    /// restore it is ignored.
     signaled: bool,
 }
 
@@ -114,9 +124,6 @@ struct Reply {
     reasoning: String,
     content: String,
     calls: Vec<PartialCall>,
-    /// Content has started displaying (after the blank line separating it from any
-    /// reasoning shown above it).
-    content_shown: bool,
 }
 
 #[derive(Default)]
@@ -124,6 +131,22 @@ struct PartialCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+}
+
+/// A line shown in the transcript but never sent to the model.
+struct Note {
+    anchor: Anchor,
+    text: String,
+    style: Style,
+}
+
+/// Where a note is shown. A note whose anchor is removed disappears with it.
+enum Anchor {
+    /// Under the call's code, above its result (classifier verdicts).
+    Call(String),
+    /// After the first `n` messages (errors). Adjusted when earlier
+    /// messages are removed.
+    After(usize),
 }
 
 enum Step {
@@ -148,13 +171,11 @@ impl App {
         let result = self.run_loop(tui).await;
         // Exiting mid-turn, including on an error or a signal, keeps the partial
         // reply and records results for its tool calls.
-        let tui = (!self.signaled).then_some(tui);
-        let stopped = self.stop_turn(tui, None);
+        let stopped = self.stop_turn(None);
         result.and(stopped)
     }
 
     async fn run_loop(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
-        print_transcript(tui, &self.session.messages)?;
         let mut input = spawn_input_reader();
         // Closing the terminal (SIGHUP) or a kill would otherwise skip cleanup,
         // orphaning the REPL and leaving tool calls without results. In raw mode
@@ -164,9 +185,16 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            tui.draw(&self.textarea, self.status_line())?;
-            // Biased toward input so a queued resize is handled before more transcript
-            // output is placed using pre-resize coordinates.
+            let status = self.status_line();
+            let blocks = build_blocks(
+                self.settings.chat_prompt.as_deref(),
+                &self.session.messages,
+                &self.notes,
+                self.turn.as_ref(),
+            );
+            tui.draw(&blocks, &mut self.view, &self.textarea, status)?;
+            // Biased toward input so keys (Esc above all) are handled before more
+            // output from a fast stream.
             let step = tokio::select! {
                 biased;
                 _ = hangup.recv() => Step::Signal,
@@ -186,30 +214,30 @@ impl App {
                         return Ok(());
                     }
                 }
-                Step::Turn(TurnEvent::Stream(event)) => self.on_stream(tui, event)?,
-                Step::Turn(TurnEvent::Verdict(verdict)) => self.on_verdict(tui, verdict)?,
-                Step::Turn(TurnEvent::Repl(event)) => self.on_repl(tui, event)?,
+                Step::Turn(TurnEvent::Stream(event)) => self.on_stream(event)?,
+                Step::Turn(TurnEvent::Verdict(verdict)) => self.on_verdict(verdict)?,
+                Step::Turn(TurnEvent::Repl(event)) => self.on_repl(event)?,
             }
-            self.advance(tui).await?;
+            self.advance().await?;
         }
     }
 
     /// Move the turn forward until it waits on something: the stream, the
     /// classifier, the user, or the REPL.
-    async fn advance(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
+    async fn advance(&mut self) -> anyhow::Result<()> {
         loop {
             let Some(turn) = self.turn.as_mut() else {
                 return Ok(());
             };
             match std::mem::replace(&mut turn.phase, Phase::Idle) {
                 Phase::Idle => match turn.queue.pop_front() {
-                    Some(call) => self.begin_call(tui, call)?,
+                    Some(call) => self.begin_call(call)?,
                     None => {
                         self.start_request();
                         return Ok(());
                     }
                 },
-                Phase::Ready(call) => self.run_call(tui, call).await?,
+                Phase::Ready(call) => self.run_call(call).await?,
                 waiting => {
                     turn.phase = waiting;
                     return Ok(());
@@ -232,24 +260,11 @@ impl App {
                 reasoning: String::new(),
                 content: String::new(),
                 calls: Vec::new(),
-                content_shown: false,
             });
         }
     }
 
-    fn on_stream(&mut self, tui: &mut Tui, event: StreamEvent) -> anyhow::Result<()> {
-        let first = match event {
-            StreamEvent::Done { truncated } => return self.end_stream(tui, truncated),
-            StreamEvent::Error(error) => return self.stop_turn(Some(tui), Some(error)),
-            StreamEvent::Usage { total, prompt } => {
-                self.context_tokens = Some(total);
-                if let Some(prompt) = prompt {
-                    self.prompt_tokens = Some(prompt);
-                }
-                return Ok(());
-            }
-            delta => delta,
-        };
+    fn on_stream(&mut self, event: StreamEvent) -> anyhow::Result<()> {
         let Some(Turn {
             phase: Phase::Streaming(reply),
             ..
@@ -257,24 +272,21 @@ impl App {
         else {
             return Ok(());
         };
-        // Coalesce deltas that are already queued: each append waits on a terminal
-        // round-trip, so appending them one at a time would fall behind a fast stream.
-        // Consecutive deltas of the same kind merge into one run.
-        let mut runs: Vec<(bool, String)> = Vec::new(); // (is_reasoning, text)
-        let mut next = None;
-        let mut event = Some(first);
+        // Take the events already queued too, so a fast stream costs one frame per
+        // batch rather than one per delta.
+        let mut event = Some(event);
         while let Some(current) = event.take() {
-            let (is_reasoning, text) = match current {
-                StreamEvent::Reasoning(text) => (true, text),
-                StreamEvent::Content(text) => (false, text),
+            match current {
+                StreamEvent::Reasoning(text) => reply.reasoning.push_str(&text),
+                StreamEvent::Content(text) => reply.content.push_str(&text),
                 StreamEvent::ToolCall {
                     index,
                     id,
                     name,
                     arguments,
                 } => {
-                    // Tool calls aren't displayed while streaming; the code is shown
-                    // once the call is handled.
+                    // Tool calls aren't displayed while streaming; they appear once
+                    // the reply is saved.
                     if reply.calls.len() <= index {
                         reply.calls.resize_with(index + 1, PartialCall::default);
                     }
@@ -282,64 +294,31 @@ impl App {
                     call.id = call.id.take().or(id);
                     call.name = call.name.take().or(name);
                     call.arguments.push_str(&arguments);
-                    event = reply.events.try_recv().ok();
-                    continue;
                 }
                 StreamEvent::Usage { total, prompt } => {
                     self.context_tokens = Some(total);
                     if let Some(prompt) = prompt {
                         self.prompt_tokens = Some(prompt);
                     }
-                    event = reply.events.try_recv().ok();
-                    continue;
                 }
-                end => {
-                    next = Some(end);
-                    break;
-                }
-            };
-            // Record before terminal I/O so a terminal error can't lose received text.
-            if is_reasoning {
-                reply.reasoning.push_str(&text);
-            } else {
-                reply.content.push_str(&text);
-            }
-            match runs.last_mut() {
-                Some((kind, run)) if *kind == is_reasoning => run.push_str(&text),
-                _ => runs.push((is_reasoning, text)),
+                StreamEvent::Done { truncated } => return self.end_stream(truncated),
+                StreamEvent::Error(error) => return self.stop_turn(Some(error)),
             }
             event = reply.events.try_recv().ok();
         }
-
-        for (is_reasoning, text) in runs {
-            if is_reasoning {
-                tui.append(&text, reasoning_style())?;
-                continue;
-            }
-            if !reply.content_shown {
-                reply.content_shown = true;
-                if !reply.reasoning.is_empty() {
-                    tui.print("", plain())?;
-                }
-            }
-            tui.append(&text, plain())?;
-        }
-        match next {
-            Some(event) => self.on_stream(tui, event),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// The response finished: queue its tool calls, or end the turn. A response cut
     /// off at the token limit is treated as interrupted.
-    fn end_stream(&mut self, tui: &mut Tui, truncated: bool) -> anyhow::Result<()> {
+    fn end_stream(&mut self, truncated: bool) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
         let Phase::Streaming(reply) = std::mem::replace(&mut turn.phase, Phase::Idle) else {
             return Ok(());
         };
-        let (calls, shown, saved) = self.save_reply(reply, truncated);
+        let (calls, saved) = self.save_reply(reply, truncated);
         // Queue the calls before anything can fail, so an error exit still records a
         // result for each of them.
         if calls.is_empty() {
@@ -347,20 +326,19 @@ impl App {
         } else if let Some(turn) = self.turn.as_mut() {
             turn.queue = calls.into();
         }
-        saved?;
-        show_reply_end(tui, shown, None)
+        saved
     }
 
-    /// Save the response as an assistant message. Returns its complete tool calls,
-    /// whether any text was shown, and the save result (the message is in the session
-    /// either way; a failed save is retried by the next one). When `interrupted`, a
-    /// call whose arguments aren't valid JSON was still streaming and is dropped; it
-    /// never ran, so nothing it did needs recording. Does no terminal I/O.
+    /// Save the response as an assistant message. Returns its complete tool calls and
+    /// the save result (the message is in the session either way; a failed save is
+    /// retried by the next one). When `interrupted`, a call whose arguments aren't
+    /// valid JSON was still streaming and is dropped; it never ran, so nothing it did
+    /// needs recording.
     fn save_reply(
         &mut self,
         reply: Reply,
         interrupted: bool,
-    ) -> (Vec<ToolCall>, bool, anyhow::Result<()>) {
+    ) -> (Vec<ToolCall>, anyhow::Result<()>) {
         reply.task.abort();
         let calls: Vec<ToolCall> = reply
             .calls
@@ -380,8 +358,8 @@ impl App {
                 })
             })
             .collect();
-        let shown = !reply.reasoning.is_empty() || !reply.content.is_empty();
-        let saved = if shown || !calls.is_empty() {
+        let has_text = !reply.reasoning.is_empty() || !reply.content.is_empty();
+        let saved = if has_text || !calls.is_empty() {
             self.session.push(Message {
                 role: Role::Assistant,
                 content: reply.content,
@@ -392,28 +370,21 @@ impl App {
         } else {
             Ok(())
         };
-        (calls, shown, saved)
+        (calls, saved)
     }
 
-    /// Start the call's approval according to the current mode, then show it. Calls
-    /// that can't run get their result recorded here, leaving the turn `Idle`.
+    /// Start the call's approval according to the current mode. Calls that can't run
+    /// get their result recorded here, leaving the turn `Idle`.
     ///
     /// Ordering rule (here and in every handler below): a call's result is recorded,
-    /// or the call is placed back in turn state, before any terminal I/O. Terminal
-    /// calls can fail, and an error exit must still leave a result for every call.
-    fn begin_call(&mut self, tui: &mut Tui, call: ToolCall) -> anyhow::Result<()> {
+    /// or the call is placed back in turn state, before anything that can fail, so an
+    /// error exit still leaves a result for every call.
+    fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
         let code = match code_of(&call) {
             Ok(code) => code,
-            Err(error) => {
-                self.record_result(&call, error.clone())?;
-                tui.print(&call.function.arguments, plain())?;
-                return show_result(tui, &error);
-            }
+            Err(error) => return self.record_result(&call, error),
         };
-        let call = PendingCall {
-            call,
-            code: code.clone(),
-        };
+        let call = PendingCall { call, code };
         let phase = match self.settings.approval_mode {
             _ if is_exempt(&call.code) => Phase::Ready(call),
             ApprovalMode::Allow => Phase::Ready(call),
@@ -434,7 +405,7 @@ impl App {
             }
         };
         self.set_phase(phase);
-        Ok(show_code(tui, &code)?)
+        Ok(())
     }
 
     fn set_phase(&mut self, phase: Phase) {
@@ -443,11 +414,7 @@ impl App {
         }
     }
 
-    fn on_verdict(
-        &mut self,
-        tui: &mut Tui,
-        verdict: anyhow::Result<Verdict>,
-    ) -> anyhow::Result<()> {
+    fn on_verdict(&mut self, verdict: anyhow::Result<Verdict>) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
@@ -455,22 +422,21 @@ impl App {
         else {
             return Ok(());
         };
+        let anchor = Anchor::Call(call.call.id.clone());
         match verdict {
             Ok(Verdict {
                 effects,
                 verdict: VerdictKind::Safe,
             }) => {
                 self.set_phase(Phase::Ready(call));
-                Ok(tui.print(&format!("safe: {effects}"), plain().green())?)
+                self.note(anchor, format!("safe: {effects}"), Style::new().green());
             }
             Ok(Verdict {
                 effects,
                 verdict: VerdictKind::Unsafe,
             }) => {
-                let result = format!("Blocked: {effects}");
-                self.record_result(&call.call, result.clone())?;
-                tui.print(&format!("unsafe: {effects}"), plain().red())?;
-                show_result(tui, &result)
+                self.record_result(&call.call, format!("Blocked: {effects}"))?;
+                self.note(anchor, format!("unsafe: {effects}"), Style::new().red());
             }
             Ok(Verdict {
                 effects,
@@ -481,7 +447,7 @@ impl App {
                     call,
                     effects: Some(effects),
                 });
-                Ok(tui.print(&line, plain().yellow())?)
+                self.note(anchor, line, Style::new().yellow());
             }
             // A classifier failure asks the user rather than blocking or running.
             Err(error) => {
@@ -489,13 +455,23 @@ impl App {
                     call,
                     effects: None,
                 });
-                Ok(tui.print(&format!("classifier failed: {error:#}"), plain().yellow())?)
+                let line = format!("classifier failed: {error:#}");
+                self.note(anchor, line, Style::new().yellow());
             }
         }
+        Ok(())
+    }
+
+    fn note(&mut self, anchor: Anchor, text: String, style: Style) {
+        self.notes.push(Note {
+            anchor,
+            text,
+            style,
+        });
     }
 
     /// Answer the approval prompt.
-    fn approve(&mut self, tui: &mut Tui, allow: bool) -> anyhow::Result<()> {
+    fn approve(&mut self, allow: bool) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
@@ -511,11 +487,10 @@ impl App {
             Some(effects) => format!("Denied by user: {effects}"),
             None => "Denied by user.".to_string(),
         };
-        self.record_result(&call.call, result.clone())?;
-        show_result(tui, &result)
+        self.record_result(&call.call, result)
     }
 
-    async fn run_call(&mut self, tui: &mut Tui, call: PendingCall) -> anyhow::Result<()> {
+    async fn run_call(&mut self, call: PendingCall) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
@@ -524,8 +499,7 @@ impl App {
                 Ok(repl) => turn.repl = Some(repl),
                 Err(error) => {
                     let result = format!("REPL failed to start: {error:#}");
-                    self.record_result(&call.call, result.clone())?;
-                    return show_result(tui, &result);
+                    return self.record_result(&call.call, result);
                 }
             }
         }
@@ -535,9 +509,7 @@ impl App {
         if let Err(error) = repl.send(&call.code, self.prompt_tokens).await {
             // Dropping the REPL kills it; the next call starts a fresh one.
             turn.repl = None;
-            let result = format!("{error:#}");
-            self.record_result(&call.call, result.clone())?;
-            return show_result(tui, &result);
+            return self.record_result(&call.call, format!("{error:#}"));
         }
         turn.phase = Phase::Running {
             call,
@@ -546,7 +518,7 @@ impl App {
         Ok(())
     }
 
-    fn on_repl(&mut self, tui: &mut Tui, event: anyhow::Result<ReplEvent>) -> anyhow::Result<()> {
+    fn on_repl(&mut self, event: anyhow::Result<ReplEvent>) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
@@ -555,9 +527,8 @@ impl App {
         };
         let (value, error) = match event {
             Ok(ReplEvent::Output(text)) => {
-                // Record before terminal I/O, as with streamed replies.
                 output.push_str(&text);
-                return Ok(tui.append(&text, tool_output_style())?);
+                return Ok(());
             }
             Ok(ReplEvent::Done { value, error }) => (value, error),
             // The process died: its state is gone, and the next call starts a new one.
@@ -577,20 +548,10 @@ impl App {
             }
             output.push_str(extra);
         }
-        let empty = output.is_empty();
-        self.record_result(&call.call, output)?;
-
-        tui.end_line()?;
-        for extra in &extras {
-            tui.print(extra.trim_end_matches('\n'), tool_output_style())?;
-        }
-        if empty {
-            tui.print("(no output)", tool_output_style())?;
-        }
-        Ok(tui.print("", plain())?)
+        self.record_result(&call.call, output)
     }
 
-    /// Record a call's result, capped at the output limit. No terminal I/O.
+    /// Record a call's result, capped at the output limit.
     fn record_result(&mut self, call: &ToolCall, result: String) -> anyhow::Result<()> {
         let result = if result.is_empty() {
             "(no output)".to_string()
@@ -602,32 +563,27 @@ impl App {
 
     /// End the turn now (Esc, `/exit`, a stream error, or app exit). The partial reply
     /// is kept; running code is killed and its output so far recorded; every other
-    /// complete call gets a `[not run]` result so the session stays valid.
-    ///
-    /// `tui` is `None` when exiting on a signal: the terminal may be gone, and each
-    /// print would wait out the cursor-position timeout, so only recording happens.
-    fn stop_turn(&mut self, tui: Option<&mut Tui>, error: Option<String>) -> anyhow::Result<()> {
+    /// complete call gets a `[not run]` result so the session stays valid, shown under
+    /// its call. `error` (a stream error) is shown as a note.
+    fn stop_turn(&mut self, error: Option<String>) -> anyhow::Result<()> {
         let Some(mut turn) = self.turn.take() else {
             return Ok(());
         };
-        // Record everything before any terminal I/O. A failed save doesn't stop the
-        // rest: each message is already in the session, and a later save writes it.
+        // A failed save doesn't stop the rest: each message is already in the
+        // session, and a later save writes it.
         let mut first_error: Option<anyhow::Error> = None;
-        let mut note = |result: anyhow::Result<()>| {
+        let mut check = |result: anyhow::Result<()>| {
             if let Err(e) = result {
                 first_error.get_or_insert(e);
             }
         };
         let mut not_run = Vec::new();
-        let mut reply_shown = None;
-        let mut stopped = false;
         match std::mem::replace(&mut turn.phase, Phase::Idle) {
             Phase::Idle => {}
             Phase::Streaming(reply) => {
-                let (calls, shown, saved) = self.save_reply(reply, true);
-                note(saved);
+                let (calls, saved) = self.save_reply(reply, true);
+                check(saved);
                 not_run = calls;
-                reply_shown = Some(shown);
             }
             Phase::Classifying { call, task } => {
                 task.abort();
@@ -642,39 +598,40 @@ impl App {
                     output.push('\n');
                 }
                 output.push_str(STOPPED);
-                note(self.record_result(&call.call, output));
-                stopped = true;
+                check(self.record_result(&call.call, output));
             }
         }
         not_run.extend(turn.queue.drain(..));
         for call in &not_run {
-            note(self.record_result(call, NOT_RUN.to_string()));
+            check(self.record_result(call, NOT_RUN.to_string()));
         }
         drop(turn); // Kills the REPL, if any.
-        if let Some(e) = first_error {
-            return Err(e);
-        }
 
-        let Some(tui) = tui else {
-            return Ok(());
-        };
-        if let Some(shown) = reply_shown {
-            show_reply_end(tui, shown, error)?;
+        if let Some(error) = error {
+            let end = Anchor::After(self.session.messages.len());
+            self.note(end, format!("error: {error}"), Style::new().red());
         }
-        if stopped {
-            tui.end_line()?;
-            show_result(tui, STOPPED)?;
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        if !not_run.is_empty() {
-            show_result(tui, &format!("{NOT_RUN} ({} tool calls)", not_run.len()))?;
-        }
-        Ok(())
     }
 
     fn on_input(&mut self, tui: &mut Tui, event: Event) -> anyhow::Result<Flow> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.notice = None;
+                self.view.clear_selection();
+                // Scroll keys work in every state, including at an approval prompt.
+                let page = match key.code {
+                    KeyCode::PageUp => Some(-1),
+                    KeyCode::PageDown => Some(1),
+                    _ => None,
+                };
+                if let Some(direction) = page {
+                    self.view.page(direction);
+                    return Ok(Flow::Continue);
+                }
                 // While a call awaits approval, only y/n, Esc, and Shift+Tab act.
                 if matches!(
                     self.turn,
@@ -684,23 +641,37 @@ impl App {
                     })
                 ) {
                     match key.code {
-                        KeyCode::Char('y') => self.approve(tui, true)?,
-                        KeyCode::Char('n') => self.approve(tui, false)?,
-                        KeyCode::Esc => self.stop_turn(Some(tui), None)?,
+                        KeyCode::Char('y') => self.approve(true)?,
+                        KeyCode::Char('n') => self.approve(false)?,
+                        KeyCode::Esc => self.stop_turn(None)?,
                         KeyCode::BackTab => self.cycle_mode(),
                         _ => {}
                     }
                     return Ok(Flow::Continue);
                 }
                 match input::handle_key(&mut self.textarea, key) {
-                    InputAction::Submit(text) => return self.submit(tui, text),
-                    InputAction::Stop => self.stop_turn(Some(tui), None)?,
+                    InputAction::Submit(text) => return self.submit(text),
+                    InputAction::Stop => self.stop_turn(None)?,
                     InputAction::CycleMode => self.cycle_mode(),
                     InputAction::None => {}
                 }
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.view.scroll(-1),
+                MouseEventKind::ScrollDown => self.view.scroll(1),
+                MouseEventKind::Down(MouseButton::Left) => self.view.press(mouse.column, mouse.row),
+                MouseEventKind::Drag(MouseButton::Left) => self.view.drag(mouse.column, mouse.row),
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(text) = self.view.release()
+                        && let Err(error) = tui.copy(&text)
+                    {
+                        self.notice = Some(format!("couldn't copy: {error}"));
+                    }
+                }
+                _ => {}
+            },
             Event::Paste(text) => input::paste(&mut self.textarea, &text),
-            Event::Resize(..) => tui.handle_resize()?,
+            // A resize needs nothing here: the next frame lays out at the new size.
             _ => {}
         }
         Ok(Flow::Continue)
@@ -719,7 +690,7 @@ impl App {
     /// Commands run in any state and keep an unknown command in the input for
     /// correction. A message is sent only when no turn is in progress; otherwise the
     /// draft is kept.
-    fn submit(&mut self, tui: &mut Tui, text: String) -> anyhow::Result<Flow> {
+    fn submit(&mut self, text: String) -> anyhow::Result<Flow> {
         if text.starts_with('/') {
             match text.trim_end() {
                 "/exit" | "/quit" => return Ok(Flow::Exit),
@@ -733,15 +704,21 @@ impl App {
         }
 
         self.textarea.clear();
+        self.view.scroll_to_bottom();
         // Only the current turn's synthetic calls stay in context: remove every
         // earlier call made only of `FYI()`/`help()` (synthetic or the model's own)
         // before adding this turn's. The session file is the prompt, so they leave
         // the file too.
-        self.session
+        let removed = self
+            .session
             .remove_calls(|call| code_of(call).is_ok_and(|code| is_exempt(&code)))?;
-        // Save before terminal I/O so a terminal error can't lose the message.
+        // Notes placed after a message keep their place among the messages left.
+        for note in &mut self.notes {
+            if let Anchor::After(n) = &mut note.anchor {
+                *n -= removed.partition_point(|&index| index < *n);
+            }
+        }
         self.session.push(Message::user(text))?;
-        let user_index = self.session.messages.len() - 1;
 
         // Each turn opens with two synthetic calls that the app makes as if the model
         // had: `FYI()` and `help()`, both exempt from approval. `advance` runs them,
@@ -761,12 +738,6 @@ impl App {
             repl: None,
         });
         saved?;
-
-        // Only the user message: the `FYI()` call is shown when `advance` runs it.
-        print_transcript(
-            tui,
-            std::slice::from_ref(&self.session.messages[user_index]),
-        )?;
         Ok(Flow::Continue)
     }
 
@@ -793,6 +764,9 @@ impl App {
                 Style::default().yellow(),
             ));
         }
+        if self.view.scrolled_up() {
+            spans.push(Span::styled(" · scrolled up (PgDn)", tui::dim()));
+        }
         if let Some(notice) = &self.notice {
             spans.push(Span::styled(" · ", tui::dim()));
             spans.push(Span::styled(notice.clone(), Style::default().yellow()));
@@ -801,82 +775,127 @@ impl App {
     }
 }
 
-/// Print messages as they looked live. Tool results are printed under their calls,
-/// matched by id, rather than in file order.
+/// The transcript as drawn, so it always matches what the model sees: the system
+/// message, the messages (each tool result under its call, matched by id, rather
+/// than in file order), and the turn in progress. Notes appear where anchored.
 ///
-/// Everything is written as one batch (see `Tui::print_batch`), so a long session
-/// appears at once with its end in view and the rest in scrollback.
-fn print_transcript(tui: &mut Tui, messages: &[Message]) -> io::Result<()> {
-    let mut blocks: Vec<(String, ContentStyle)> = Vec::new();
-    // Trailing newlines are trimmed so each block ends where it did live.
-    let mut add = |text: &str, style: ContentStyle| {
-        blocks.push((text.trim_end_matches('\n').to_string(), style));
+/// Each block gets a `Key` naming what it shows, so the view's scroll position and
+/// selection stay on the same text when blocks are inserted before it. A call's
+/// result reuses the key of its live output, which it replaces.
+fn build_blocks<'a>(
+    system: Option<&'a str>,
+    messages: &'a [Message],
+    notes: &'a [Note],
+    turn: Option<&'a Turn>,
+) -> Vec<Block<'a>> {
+    let blank = |key| Block::new(key, "", plain());
+    let mut blocks = Vec::new();
+    if let Some(system) = system {
+        blocks.push(Block::new(Key::System(0), "system", tui::dim()));
+        blocks.push(Block::new(Key::System(1), system, plain()));
+        blocks.push(blank(Key::System(2)));
+    }
+
+    let results: HashMap<&str, &str> = messages
+        .iter()
+        .filter_map(|m| Some((m.tool_call_id.as_deref()?, m.content.as_str())))
+        .collect();
+    let mut call_notes: HashMap<&str, Vec<&Note>> = HashMap::new();
+    let mut position_notes = Vec::new();
+    for (index, note) in notes.iter().enumerate() {
+        match &note.anchor {
+            Anchor::Call(id) => call_notes.entry(id).or_default().push(note),
+            Anchor::After(n) => position_notes.push((*n, index, note)),
+        }
+    }
+    // Notes are added in order, and cleanup keeps their positions in order.
+    let mut position_notes = position_notes.into_iter().peekable();
+    let mut add_position_notes = |through: usize, blocks: &mut Vec<Block<'a>>| {
+        while let Some((_, index, note)) = position_notes.next_if(|&(n, ..)| n <= through) {
+            blocks.push(Block::new(
+                Key::Note(index, 0),
+                note.text.as_str(),
+                note.style,
+            ));
+            blocks.push(blank(Key::Note(index, 1)));
+        }
     };
-    for message in messages {
+    let (phase, running) = match turn.map(|t| &t.phase) {
+        Some(Phase::Running { call, output }) => (None, Some((&call.call.id, output))),
+        phase => (phase, None),
+    };
+
+    for (i, message) in messages.iter().enumerate() {
+        add_position_notes(i, &mut blocks);
+        let part = |n| Key::Message(i, n);
         match message.role {
             Role::User => {
-                add(&format!("> {}", message.content), plain().cyan());
-                add("", plain());
+                let text = format!("> {}", message.content);
+                blocks.push(Block::new(part(0), text, user_style()));
+                blocks.push(blank(part(1)));
             }
             Role::Assistant => {
                 if let Some(reasoning) = &message.reasoning {
-                    add(reasoning, reasoning_style());
+                    blocks.push(Block::new(part(0), reasoning.as_str(), reasoning_style()));
                     if !message.content.is_empty() {
-                        add("", plain());
+                        blocks.push(blank(part(1)));
                     }
                 }
                 if !message.content.is_empty() {
-                    add(&message.content, plain());
+                    blocks.push(Block::new(part(2), message.content.as_str(), plain()));
                 }
                 if message.reasoning.is_some() || !message.content.is_empty() {
-                    add("", plain());
+                    blocks.push(blank(part(3)));
                 }
                 for call in message.tool_calls.iter().flatten() {
+                    // Parts: 0 label, 1 code, 2 result or live output, 3 blank, 4+ notes.
+                    let part = |n| Key::Call(call.id.clone(), n);
                     match code_of(call) {
                         Ok(code) => {
-                            add("REPL", plain().dim());
-                            add(&code, plain());
+                            blocks.push(Block::new(part(0), "REPL", tui::dim()));
+                            blocks.push(Block::new(part(1), code, plain()));
                         }
-                        Err(_) => add(&call.function.arguments, plain()),
+                        Err(_) => {
+                            let arguments = call.function.arguments.as_str();
+                            blocks.push(Block::new(part(0), arguments, plain()))
+                        }
                     }
-                    let result = messages
-                        .iter()
-                        .find(|m| m.tool_call_id.as_deref() == Some(&call.id));
-                    if let Some(result) = result {
-                        add(&result.content, tool_output_style());
+                    let call_notes = call_notes.get(call.id.as_str()).into_iter().flatten();
+                    for (n, note) in call_notes.enumerate() {
+                        let key = part(4 + n as u8);
+                        blocks.push(Block::new(key, note.text.as_str(), note.style));
                     }
-                    add("", plain());
+                    if let Some(result) = results.get(call.id.as_str()) {
+                        blocks.push(Block::new(part(2), *result, tool_output_style()));
+                    } else if let Some((id, output)) = running
+                        && *id == call.id
+                        && !output.is_empty()
+                    {
+                        blocks.push(Block::new(part(2), output.as_str(), tool_output_style()));
+                    }
+                    blocks.push(blank(part(3)));
                 }
             }
             Role::Tool => {}
         }
     }
-    tui.print_batch(&blocks)
-}
+    add_position_notes(usize::MAX, &mut blocks);
 
-/// A tool result that wasn't streamed live, closing the call's block.
-fn show_result(tui: &mut Tui, text: &str) -> anyhow::Result<()> {
-    tui.print(text, tool_output_style())?;
-    Ok(tui.print("", plain())?)
-}
-
-/// Close a response's display: end its last line, then the blank line after any
-/// text, then the error, if there was one.
-fn show_reply_end(tui: &mut Tui, shown: bool, error: Option<String>) -> anyhow::Result<()> {
-    tui.end_line()?;
-    if shown {
-        tui.print("", plain())?;
+    // Keyed as the message it will be saved as, so saving it changes no keys.
+    if let Some(Phase::Streaming(reply)) = phase {
+        let part = |n| Key::Message(messages.len(), n);
+        if !reply.reasoning.is_empty() {
+            let reasoning = reply.reasoning.as_str();
+            blocks.push(Block::new(part(0), reasoning, reasoning_style()));
+        }
+        if !reply.content.is_empty() {
+            if !reply.reasoning.is_empty() {
+                blocks.push(blank(part(1)));
+            }
+            blocks.push(Block::new(part(2), reply.content.as_str(), plain()));
+        }
     }
-    if let Some(error) = error {
-        tui.print(&format!("error: {error}"), plain().red())?;
-        tui.print("", plain())?;
-    }
-    Ok(())
-}
-
-fn show_code(tui: &mut Tui, code: &str) -> io::Result<()> {
-    tui.print("REPL", plain().dim())?;
-    tui.print(code.trim_end_matches('\n'), plain())
+    blocks
 }
 
 /// The two synthetic calls opening each turn: `FYI()` for the environment
@@ -958,16 +977,20 @@ fn thousands(n: u64) -> String {
     out
 }
 
-fn plain() -> ContentStyle {
-    ContentStyle::new()
+fn plain() -> Style {
+    Style::new()
 }
 
-fn reasoning_style() -> ContentStyle {
-    ContentStyle::new().dim()
+fn user_style() -> Style {
+    Style::new().cyan()
 }
 
-fn tool_output_style() -> ContentStyle {
-    ContentStyle::new().dim()
+fn reasoning_style() -> Style {
+    tui::dim()
+}
+
+fn tool_output_style() -> Style {
+    tui::dim()
 }
 
 async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
@@ -993,10 +1016,7 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
 }
 
 /// Read terminal events on a dedicated thread. It polls with a timeout instead of
-/// blocking in `read` (or using crossterm's `EventStream`) because crossterm holds its
-/// input lock while waiting, and `cursor::position()`, which the terminal layer uses
-/// after every print, needs that lock. A `position()` call can wait out the rest of
-/// the current poll window, so the window is kept short.
+/// blocking in `read` so it notices when the app has stopped listening and exits.
 fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {

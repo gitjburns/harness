@@ -4,6 +4,7 @@ mod config;
 mod input;
 mod repl;
 mod session;
+mod transcript;
 mod tui;
 
 use std::path::PathBuf;
@@ -27,7 +28,8 @@ async fn main() -> anyhow::Result<()> {
     let session = match args.resume {
         Some(path) => {
             let (session, repaired) = Session::resume(path)?;
-            // Printed before the TUI starts, so it stays in scrollback above it.
+            // Printed to the normal screen before the TUI's alternate screen, so it's
+            // there after exit.
             if repaired > 0 {
                 println!(
                     "{}: added {NOT_RUN} for {repaired} tool calls without results",
