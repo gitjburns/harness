@@ -41,12 +41,13 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn start(output_limit: usize) -> anyhow::Result<Repl> {
+    pub fn start(output_limit: usize, model: &str) -> anyhow::Result<Repl> {
         let mut child = Command::new("python3")
             .arg("-u")
             .arg("-c")
             .arg(DRIVER)
             .env("HARNESS_OUTPUT_LIMIT", output_limit.to_string())
+            .env("HARNESS_MODEL", model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The driver redirects fd 2 into its capture pipe at startup; anything
@@ -68,8 +69,13 @@ impl Repl {
         })
     }
 
-    pub async fn send(&mut self, code: &str) -> anyhow::Result<()> {
-        let line = format!("{}\n", json!({ "code": code }));
+    /// Run `code`. `prompt_tokens` is the latest reported prompt size, sent with every
+    /// call so `FYI()` reports the count current at call time.
+    pub async fn send(&mut self, code: &str, prompt_tokens: Option<u64>) -> anyhow::Result<()> {
+        let line = format!(
+            "{}\n",
+            json!({ "code": code, "prompt_tokens": prompt_tokens })
+        );
         self.stdin
             .write_all(line.as_bytes())
             .await

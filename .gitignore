@@ -1,3 +1,4 @@
 .env
 sessions
 target
+src/__pycache__/

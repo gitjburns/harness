@@ -60,6 +60,8 @@ The status line under the prompt shows the model, the number of tokens in use (a
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
+**Situational awareness.** Each turn starts with the app calling `FYI(); help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (`n/a` before the first), and the model; `help()` lists the output limit and library functions. The call and its output are shown and saved like any other, and the model can call either itself at any time. Code made only of `FYI()` and `help()` never needs approval, in any mode.
+
 ### Approval modes
 
 Shift+Tab cycles the mode; the choice is saved to `config.toml`.

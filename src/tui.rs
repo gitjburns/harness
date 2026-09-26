@@ -79,6 +79,29 @@ impl Tui {
         self.append(&format!("{text}\n"), style)
     }
 
+    /// Print many complete, styled blocks of text in one write with a single cursor
+    /// query, after ending any pending line. Used for replaying a session: printing
+    /// block by block costs a cursor round-trip each, which on a long session runs past
+    /// the terminal's synchronized-update limit and visibly scrolls.
+    pub fn print_batch(&mut self, blocks: &[(String, ContentStyle)]) -> io::Result<()> {
+        self.end_line()?;
+        self.begin_frame()?;
+        queue!(
+            self.out,
+            MoveTo(0, self.region_top),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        for (text, style) in blocks {
+            for line in text.split('\n') {
+                self.queue_styled(line, *style)?;
+                queue!(self.out, Print("\r\n"))?;
+            }
+        }
+        self.out.flush()?;
+        self.region_top = cursor::position()?.1;
+        Ok(())
+    }
+
     /// Terminate the pending line, if any.
     pub fn end_line(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {

@@ -13,10 +13,14 @@ Working log. Behavior contract: `SPEC.md`.
 7. **Context tokens.** `stream_options.include_usage`; status line shows `total_tokens`.
 8. **Tool calling.** Single `REPL` tool; per-turn local Python driver (`src/repl_driver.py`) with `replib/` registry and `help()`; `approval_mode` allow/ask/auto (Shift+Tab, persisted via `toml_edit`); LLM classifier for `auto`; `output_limit` (default 100 KB).
 9. **Tool-calling hardening (review).** Results recorded before terminal I/O; driver `setsid()` (no controlling tty); request-reader thread; driver survives closed stdout; config save keeps decor, handles inline tables, atomic; `finish_reason: "length"` drops cut-off calls; SIGHUP/SIGTERM/SIGINT cleanup; resume answers unanswered calls; `.env` read privately.
+10. **Situational awareness.** Each turn opens with a synthetic `FYI(); help()` REPL call, run in the REPL like any other (honesty rule: synthetic calls must work when made explicitly). `FYI()` is implemented only in the driver: date, latest `prompt_tokens` (sent with every code request), model.
+11. **Approval exemption.** Code made only of `FYI()` and `help()` statements never needs approval.
+12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling.
 
 Decided against:
 - App-side word wrap of the transcript (it would break terminal reflow and copy).
 - Audit-hook gating as the first permission layer (classifier chosen instead).
+- A driver → app callback for `FYI()` (Python must not call Rust).
 
 ## Next
 

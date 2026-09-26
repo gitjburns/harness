@@ -39,6 +39,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         turn: None,
         notice: None,
         context_tokens: None,
+        prompt_tokens: None,
         signaled: false,
     };
     let result = app.run(&mut tui).await;
@@ -64,6 +65,9 @@ struct App {
     /// by the server. Unknown until a reply reports usage; stopped or failed replies
     /// report none, so the previous value stays.
     context_tokens: Option<u64>,
+    /// Prompt tokens of the last reply, sent to the model as the next turn's FYI
+    /// snapshot. Lags one turn behind; the first turn has no measurement yet.
+    prompt_tokens: Option<u64>,
     /// Exiting because of a signal: skip terminal output during cleanup.
     signaled: bool,
 }
@@ -233,8 +237,11 @@ impl App {
         let first = match event {
             StreamEvent::Done { truncated } => return self.end_stream(tui, truncated),
             StreamEvent::Error(error) => return self.stop_turn(Some(tui), Some(error)),
-            StreamEvent::Usage(total) => {
+            StreamEvent::Usage { total, prompt } => {
                 self.context_tokens = Some(total);
+                if let Some(prompt) = prompt {
+                    self.prompt_tokens = Some(prompt);
+                }
                 return Ok(());
             }
             delta => delta,
@@ -274,8 +281,11 @@ impl App {
                     event = reply.events.try_recv().ok();
                     continue;
                 }
-                StreamEvent::Usage(total) => {
+                StreamEvent::Usage { total, prompt } => {
                     self.context_tokens = Some(total);
+                    if let Some(prompt) = prompt {
+                        self.prompt_tokens = Some(prompt);
+                    }
                     event = reply.events.try_recv().ok();
                     continue;
                 }
@@ -401,6 +411,7 @@ impl App {
             code: code.clone(),
         };
         let phase = match self.settings.approval_mode {
+            _ if is_exempt(&call.code) => Phase::Ready(call),
             ApprovalMode::Allow => Phase::Ready(call),
             ApprovalMode::Ask => Phase::Approving {
                 call,
@@ -505,7 +516,7 @@ impl App {
             return Ok(());
         };
         if turn.repl.is_none() {
-            match Repl::start(self.settings.output_limit) {
+            match Repl::start(self.settings.output_limit, &self.settings.endpoint.model) {
                 Ok(repl) => turn.repl = Some(repl),
                 Err(error) => {
                     let result = format!("REPL failed to start: {error:#}");
@@ -517,7 +528,7 @@ impl App {
         let repl = turn.repl.as_mut().expect("started above");
         // The driver reads requests on a dedicated thread from startup, so this write
         // doesn't wait on library loading or on earlier code.
-        if let Err(error) = repl.send(&call.code).await {
+        if let Err(error) = repl.send(&call.code, self.prompt_tokens).await {
             // Dropping the REPL kills it; the next call starts a fresh one.
             turn.repl = None;
             let result = format!("{error:#}");
@@ -720,16 +731,32 @@ impl App {
         self.textarea.clear();
         // Save before terminal I/O so a terminal error can't lose the message.
         self.session.push(Message::user(text))?;
-        print_transcript(
-            tui,
-            std::slice::from_ref(self.session.messages.last().expect("just pushed")),
-        )?;
-        // `advance` sends the first request.
+        let user_index = self.session.messages.len() - 1;
+
+        // Each turn opens with a synthetic `FYI()` call that the app makes as if the
+        // model had: a real REPL call (exempt from approval) whose result is the
+        // driver's snapshot. `advance` runs it, then sends the first request.
+        let call = fyi_call();
+        let saved = self.session.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![call.clone()]),
+            ..Default::default()
+        });
+        // Queue the call before the save result is checked: the message is in the
+        // session either way, and an error exit must still record its result.
         self.turn = Some(Turn {
             phase: Phase::Idle,
-            queue: VecDeque::new(),
+            queue: VecDeque::from([call]),
             repl: None,
         });
+        saved?;
+
+        // Only the user message: the `FYI()` call is shown when `advance` runs it.
+        print_transcript(
+            tui,
+            std::slice::from_ref(&self.session.messages[user_index]),
+        )?;
         Ok(Flow::Continue)
     }
 
@@ -766,44 +793,55 @@ impl App {
 
 /// Print messages as they looked live. Tool results are printed under their calls,
 /// matched by id, rather than in file order.
+///
+/// Everything is written as one batch (see `Tui::print_batch`), so a long session
+/// appears at once with its end in view and the rest in scrollback.
 fn print_transcript(tui: &mut Tui, messages: &[Message]) -> io::Result<()> {
+    let mut blocks: Vec<(String, ContentStyle)> = Vec::new();
+    // Trailing newlines are trimmed so each block ends where it did live.
+    let mut add = |text: &str, style: ContentStyle| {
+        blocks.push((text.trim_end_matches('\n').to_string(), style));
+    };
     for message in messages {
         match message.role {
             Role::User => {
-                tui.print(&format!("> {}", message.content), plain().cyan())?;
-                tui.print("", plain())?;
+                add(&format!("> {}", message.content), plain().cyan());
+                add("", plain());
             }
             Role::Assistant => {
                 if let Some(reasoning) = &message.reasoning {
-                    tui.print(reasoning, reasoning_style())?;
+                    add(reasoning, reasoning_style());
                     if !message.content.is_empty() {
-                        tui.print("", plain())?;
+                        add("", plain());
                     }
                 }
                 if !message.content.is_empty() {
-                    tui.print(&message.content, plain())?;
+                    add(&message.content, plain());
                 }
                 if message.reasoning.is_some() || !message.content.is_empty() {
-                    tui.print("", plain())?;
+                    add("", plain());
                 }
                 for call in message.tool_calls.iter().flatten() {
                     match code_of(call) {
-                        Ok(code) => show_code(tui, &code)?,
-                        Err(_) => tui.print(&call.function.arguments, plain())?,
+                        Ok(code) => {
+                            add("REPL", plain().dim());
+                            add(&code, plain());
+                        }
+                        Err(_) => add(&call.function.arguments, plain()),
                     }
                     let result = messages
                         .iter()
                         .find(|m| m.tool_call_id.as_deref() == Some(&call.id));
                     if let Some(result) = result {
-                        tui.print(&result.content, tool_output_style())?;
+                        add(&result.content, tool_output_style());
                     }
-                    tui.print("", plain())?;
+                    add("", plain());
                 }
             }
             Role::Tool => {}
         }
     }
-    Ok(())
+    tui.print_batch(&blocks)
 }
 
 /// A tool result that wasn't streamed live, closing the call's block.
@@ -829,6 +867,39 @@ fn show_reply_end(tui: &mut Tui, shown: bool, error: Option<String>) -> anyhow::
 fn show_code(tui: &mut Tui, code: &str) -> io::Result<()> {
     tui.print("REPL", plain().dim())?;
     tui.print(code.trim_end_matches('\n'), plain())
+}
+
+/// The synthetic `FYI(); help()` call opening each turn: the environment snapshot and
+/// the library listing. Ids only need to be unique within a session: the timestamp
+/// keeps them unique across `--resume`, the counter within one millisecond.
+fn fyi_call() -> ToolCall {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    ToolCall {
+        id: format!(
+            "fyi-{}-{}",
+            chrono::Local::now().timestamp_millis(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+        kind: "function".to_string(),
+        function: FunctionCall {
+            name: "REPL".to_string(),
+            arguments: r#"{"code": "FYI(); help()"}"#.to_string(),
+        },
+    }
+}
+
+/// Calls that never need approval in any mode: code made only of the driver's
+/// read-only built-ins `FYI()` and `help()`, as statements separated by `;` or
+/// newlines. Any other code alongside them (`FYI(); os.remove(p)`) is judged
+/// normally, and so is `help(x)`, since its argument is evaluated.
+fn is_exempt(code: &str) -> bool {
+    let mut statements = code
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .peekable();
+    statements.peek().is_some() && statements.all(|s| matches!(s, "FYI()" | "help()"))
 }
 
 /// The `code` argument of a REPL call, or the error to return to the model.

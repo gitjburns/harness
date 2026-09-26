@@ -43,9 +43,12 @@ pub enum StreamEvent {
         name: Option<String>,
         arguments: String,
     },
-    /// `total_tokens` (prompt + completion) from the usage chunk the server sends
-    /// after the final choice chunk.
-    Usage(u64),
+    /// Usage from the final usage chunk: `total` is prompt + completion, `prompt` is
+    /// the prompt alone, sent back to the model as the next turn's FYI count.
+    Usage {
+        total: u64,
+        prompt: Option<u64>,
+    },
     /// The reply finished normally. `truncated` means it stopped at the token limit
     /// (`finish_reason: "length"`), so a tool call may have been cut off mid-stream.
     Done {
@@ -152,7 +155,12 @@ async fn stream(
                 finish_reason = Some(reason.to_string());
             }
             if let Some(total) = chunk["usage"]["total_tokens"].as_u64()
-                && tx.send(StreamEvent::Usage(total)).is_err()
+                && tx
+                    .send(StreamEvent::Usage {
+                        total,
+                        prompt: chunk["usage"]["prompt_tokens"].as_u64(),
+                    })
+                    .is_err()
             {
                 return Ok(false);
             }

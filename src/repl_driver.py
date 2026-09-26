@@ -1,7 +1,7 @@
 """REPL driver, embedded in the harness binary and run as `python3 -u -c <this>`.
 
 Protocol: JSON lines over the process's original stdin/stdout.
-  host -> driver: {"code": "..."}
+  host -> driver: {"code": "...", "prompt_tokens": n | null}
   driver -> host: {"output": "..."}   output as it is written
                   {"done": true, "value": "..." | null, "error": "..." | null}
 
@@ -30,6 +30,7 @@ import queue
 import sys
 import textwrap
 import threading
+import time
 import traceback
 import types
 
@@ -122,6 +123,25 @@ def help(obj=_missing):
 
 
 namespace = {"__name__": "__main__", "__builtins__": builtins, "help": help}
+# FYI() is the only implementation of the situational-awareness snapshot: the app's
+# synthetic call at the start of each turn runs it here too. Deliberately not
+# registered, so help() doesn't list it.
+MODEL = os.environ.get("HARNESS_MODEL", "unknown")
+# Updated from each request, so FYI() reports the count current at call time.
+prompt_tokens = None
+
+
+def _fyi():
+    now = time.localtime()
+    # `%:z` needs Python 3.12+; insert the colon into `%z` by hand instead.
+    offset = time.strftime("%z", now)
+    offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+    date = time.strftime("%a %b %d %H:%M:%S ", now) + offset + time.strftime(" %Y", now)
+    tokens = "n/a" if prompt_tokens is None else prompt_tokens
+    print(f"Date: {date}\nPrompt tokens: {tokens}\nModel: {MODEL}")
+
+
+namespace["FYI"] = _fyi
 
 
 def load_library():
@@ -181,6 +201,7 @@ load_errors = load_library()
 
 while (line := requests.get()) is not None:
     request = json.loads(line)
+    prompt_tokens = request.get("prompt_tokens")
     if load_errors:
         os.write(sync_fd, ("\n".join(load_errors) + "\n").encode())
         load_errors = []

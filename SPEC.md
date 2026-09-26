@@ -39,7 +39,7 @@ All paths are relative to the working directory.
 ## Requests
 
 - Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured.
-- SSE `data:` lines: `delta.reasoning` is reasoning, `delta.content` is content, `delta.tool_calls` are tool call fragments (by `index`; `id` and `function.name` once, `function.arguments` appended), `usage.total_tokens` is the context count, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
+- SSE `data:` lines: `delta.reasoning` is reasoning, `delta.content` is content, `delta.tool_calls` are tool call fragments (by `index`; `id` and `function.name` once, `function.arguments` appended), `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
 - Classifier: non-streaming request to the same endpoint and model. System message: `[classifier] prompt`. User message: `Repository root: <absolute working directory>` and the code in a fenced block. `response_format` is a strict JSON schema `{"effects": string, "verdict": "safe" | "unsafe" | "inconclusive"}`, both required, in that order.
 
 ## Tool calling
@@ -48,6 +48,8 @@ All paths are relative to the working directory.
   - name `REPL`, one required string parameter `code`
   - description: "Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries."
 - A turn starts with a user message. Each response's tool calls are handled in order, their results are sent, and the next response is requested. The turn ends when a response has no tool calls, on Esc, or on a stream error.
+- **Situational awareness.** Each turn opens with a synthetic call: after the user message, the app saves an assistant message with one `REPL` call `{"code": "FYI(); help()"}` (id `fyi-<unix millis>-<counter>`) and runs it in the REPL like any other call, before the first request, so every turn carries the environment snapshot and the library listing. `FYI()` is the driver's only snapshot implementation; it prints `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens, or n/a>`, and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `FYI()` is not in the registry, so `help()` doesn't list it.
+- Code made only of `FYI()` and `help()` statements (separated by `;` or newlines, whitespace ignored) runs without approval in every mode. Any other code, including code that also calls them or `help(x)`, is approved per `approval_mode`.
 - Approval, per `approval_mode` at the moment each call is handled:
   - `allow`: run.
   - `ask`: prompt `allow? (y/n)`.
@@ -60,8 +62,8 @@ All paths are relative to the working directory.
 
 ## REPL
 
-- `python3 -u -c <embedded driver>` from `PATH`, in the working directory, as the user, unsandboxed. The driver first calls `setsid()`: it has no controlling terminal (programs opening `/dev/tty` fail immediately), and it leads a process group that is killed as a whole. Started by a turn's first call, reused for the turn's later calls, killed when the turn ends. If it dies mid-call, the result ends with `[REPL process exited: …]` and the next call starts a new process.
-- Protocol: JSON lines over the process's original stdin/stdout. Host sends `{"code"}`; driver sends `{"output"}` chunks as written, then `{"done": true, "value", "error"}`. The code's stdin is `/dev/null`, and its fds 1 and 2 (inherited by subprocesses) go to a pipe the driver reads.
+- `python3 -u -c <embedded driver>` from `PATH`, in the working directory, as the user, unsandboxed. The driver first calls `setsid()`: it has no controlling terminal (programs opening `/dev/tty` fail immediately), and it leads a process group that is killed as a whole. Started by a turn's first call (the synthetic `FYI(); help()`, so every turn), reused for the turn's later calls, killed when the turn ends. If it dies mid-call, the result ends with `[REPL process exited: …]` and the next call starts a new process.
+- Protocol: JSON lines over the process's original stdin/stdout. Host sends `{"code", "prompt_tokens"}` (the latest `usage.prompt_tokens` or `null`, stored for `FYI()`); driver sends `{"output"}` chunks as written, then `{"done": true, "value", "error"}`. The code's stdin is `/dev/null`, and its fds 1 and 2 (inherited by subprocesses) go to a pipe the driver reads.
 - Code runs in one namespace per process. A trailing expression's value is returned and bound to `_`. `exit()` doesn't end the REPL.
 - `replib/*.py` are executed in sorted order at startup with `register` in scope; `@register` adds a function to the namespace and to `help()`. Load errors are printed in the first call's output.
 - `help()` prints the output limit, then each registered function's signature and docstring, or `No registered functions.`. `help(obj)` is Python's `help`.
@@ -74,7 +76,7 @@ All paths are relative to the working directory.
   - Assistant: reasoning dim, a blank line, then content in the default style.
   - Tool call: `REPL` (dim), the code, the verdict line (`safe:` green, `unsafe:` red, `inconclusive:` or `classifier failed:` yellow; `auto` only), then the output, dim, streamed live and in full.
   - A blank line follows each message and each tool call. Errors print red as `error: ...`.
-  - On resume, tool results print under their calls; verdict lines aren't shown.
+  - On resume, tool results print under their calls; verdict lines aren't shown. The whole replay is written in one write with one cursor query, so it appears at once: the end fills the screen and the rest is in scrollback (up to the terminal's scrollback limit).
 - Streaming: the unterminated last line is reprinted from its start on each update. A line taller than half the screen is committed with a hard break.
 - Each frame (transcript output plus region redraw) is one synchronized update.
 - Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line.
