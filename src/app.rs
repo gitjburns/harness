@@ -497,7 +497,11 @@ impl App {
             return Ok(());
         };
         if turn.repl.is_none() {
-            match Repl::start(self.settings.output_limit, &self.settings.endpoint.model) {
+            match Repl::start(
+                self.settings.output_limit,
+                &self.settings.endpoint.model,
+                &self.settings.dir,
+            ) {
                 Ok(repl) => turn.repl = Some(repl),
                 Err(error) => {
                     let result = format!("REPL failed to start: {error:#}");
@@ -672,7 +676,17 @@ impl App {
                             return Ok(Flow::Continue);
                         }
                         KeyCode::Enter => {
-                            return self.run_command(completions[selected].command.action);
+                            let completion = &completions[selected];
+                            if !completion.command.takes_argument {
+                                return self.run_command(completion.command.action, "");
+                            }
+                            // Can't run without its argument: complete it, followed by a
+                            // space (which closes the list), ready for the argument.
+                            self.textarea.clear();
+                            self.textarea
+                                .insert_str(format!("{} ", completion.spelling));
+                            self.input_changed();
+                            return Ok(Flow::Continue);
                         }
                         KeyCode::Esc => {
                             self.completion_dismissed = Some(self.textarea.lines().join("\n"));
@@ -722,7 +736,7 @@ impl App {
     fn cycle_mode(&mut self) {
         let mode = self.settings.approval_mode.next();
         self.settings.approval_mode = mode;
-        if let Err(error) = config::save_approval_mode(mode) {
+        if let Err(error) = config::save_approval_mode(&self.settings.dir, mode) {
             self.notice = Some(format!("couldn't save approval_mode: {error:#}"));
         }
     }
@@ -733,20 +747,27 @@ impl App {
     fn toggle_tool_reasoning(&mut self) {
         let enabled = !self.settings.tool_reasoning;
         self.settings.tool_reasoning = enabled;
-        if let Err(error) = config::save_tool_reasoning(enabled) {
+        if let Err(error) = config::save_tool_reasoning(&self.settings.dir, enabled) {
             self.notice = Some(format!("couldn't save tool_reasoning: {error:#}"));
         }
     }
 
     /// Run a command (typed in full, or picked from the completion list). The input
-    /// is cleared.
-    fn run_command(&mut self, action: Action) -> anyhow::Result<Flow> {
-        self.textarea.clear();
-        self.input_changed();
+    /// is cleared, except after a failed `/rename`, which keeps it for correction like
+    /// an unknown command.
+    fn run_command(&mut self, action: Action, argument: &str) -> anyhow::Result<Flow> {
         match action {
             Action::Exit => return Ok(Flow::Exit),
             Action::ToggleToolReasoning => self.toggle_tool_reasoning(),
+            Action::Rename => {
+                if let Err(error) = self.session.rename(argument) {
+                    self.notice = Some(format!("couldn't rename: {error:#}"));
+                    return Ok(Flow::Continue);
+                }
+            }
         }
+        self.textarea.clear();
+        self.input_changed();
         Ok(Flow::Continue)
     }
 
@@ -826,7 +847,7 @@ impl App {
         if text.starts_with('/') {
             let command = text.trim_end();
             return match commands::find(command) {
-                Some(action) => self.run_command(action),
+                Some((action, argument)) => self.run_command(action, argument),
                 None => {
                     self.notice = Some(format!("unknown command: {command}"));
                     Ok(Flow::Continue)

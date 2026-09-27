@@ -1,6 +1,7 @@
 //! The REPL process: a Python driver (`repl_driver.py`, embedded) run locally and
 //! unsandboxed in the working directory. One process lives for one turn.
 
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, bail};
@@ -10,6 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const DRIVER: &str = include_str!("repl_driver.py");
+
+/// Function library directory, inside the harness directory.
+const LIBRARY_DIR: &str = "replib";
 
 pub enum ReplEvent {
     /// Output as it is written, in order, from the code and anything it started.
@@ -41,13 +45,15 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn start(output_limit: usize, model: &str) -> anyhow::Result<Repl> {
+    /// `harness_dir` holds `replib/`; the process itself runs in the working directory.
+    pub fn start(output_limit: usize, model: &str, harness_dir: &Path) -> anyhow::Result<Repl> {
         let mut child = Command::new("python3")
             .arg("-u")
             .arg("-c")
             .arg(DRIVER)
             .env("HARNESS_OUTPUT_LIMIT", output_limit.to_string())
             .env("HARNESS_MODEL", model)
+            .env("HARNESS_LIBRARY_DIR", harness_dir.join(LIBRARY_DIR))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The driver redirects fd 2 into its capture pipe at startup; anything

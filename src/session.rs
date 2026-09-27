@@ -8,12 +8,14 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Sessions directory, inside the harness directory. A session's name is its file
+/// name without `.json`.
 const SESSIONS_DIR: &str = "sessions";
 
 /// Result recorded for a complete tool call that never ran.
@@ -154,21 +156,61 @@ pub struct Session {
     pub messages: Vec<Message>,
 }
 
+/// Session file name for `name`. Names must stay inside the sessions directory and
+/// not collide with hidden or temp files: not empty, no `/`, no leading `.`.
+fn file_name(name: &str) -> anyhow::Result<String> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        bail!("invalid session name: {name:?}");
+    }
+    Ok(format!("{name}.json"))
+}
+
+/// Names of saved sessions, least recently changed first. No sessions directory
+/// means no sessions.
+pub fn list(harness_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let dir = harness_dir.join(SESSIONS_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", dir.display()))?
+            .path();
+        // Skips `.json.tmp` files left by an interrupted save.
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let modified = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .with_context(|| format!("reading {}", path.display()))?;
+        sessions.push((modified, name.to_string()));
+    }
+    sessions.sort();
+    Ok(sessions.into_iter().map(|(_, name)| name).collect())
+}
+
 impl Session {
-    /// A new session. The file is not created until the first `save`, so a launch
-    /// with no messages leaves nothing behind.
-    pub fn new() -> Self {
+    /// A new session, named by its start time. The file is not created until the
+    /// first `save`, so a launch with no messages leaves nothing behind.
+    pub fn new(harness_dir: &Path) -> Self {
         let name = chrono::Local::now().format("%Y%m%d-%H%M%S");
         Session {
-            path: PathBuf::from(SESSIONS_DIR).join(format!("{name}.json")),
+            path: harness_dir.join(SESSIONS_DIR).join(format!("{name}.json")),
             messages: Vec::new(),
         }
     }
 
-    /// Load a session. Tool calls left without results (the app was killed or
+    /// Load session `name`. Tool calls left without results (the app was killed or
     /// crashed mid-turn) get `NOT_RUN` results, saved immediately, since the endpoint
     /// rejects every request while any are missing. Returns how many were added.
-    pub fn resume(path: PathBuf) -> anyhow::Result<(Self, usize)> {
+    pub fn resume(harness_dir: &Path, name: &str) -> anyhow::Result<(Self, usize)> {
+        let path = harness_dir.join(SESSIONS_DIR).join(file_name(name)?);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let file: SessionFile =
@@ -219,6 +261,25 @@ impl Session {
     pub fn push(&mut self, message: Message) -> anyhow::Result<()> {
         self.messages.push(message);
         self.save()
+    }
+
+    /// `/rename`: rename the session file, or before the first save, the file it will
+    /// be created as. An existing session is never overwritten.
+    pub fn rename(&mut self, name: &str) -> anyhow::Result<()> {
+        let path = self.path.with_file_name(file_name(name)?);
+        if path == self.path {
+            return Ok(());
+        }
+        if path.exists() {
+            bail!("session {name} already exists");
+        }
+        if self.path.exists() {
+            std::fs::rename(&self.path, &path).with_context(|| {
+                format!("renaming {} to {}", self.path.display(), path.display())
+            })?;
+        }
+        self.path = path;
+        Ok(())
     }
 
     /// Remove every tool call matching `matches`, with its tool result, and save if

@@ -35,7 +35,8 @@ import traceback
 import types
 
 OUTPUT_LIMIT = int(os.environ.get("HARNESS_OUTPUT_LIMIT", "100000"))
-LIBRARY_DIR = "replib"
+# Absolute path of `replib/` in the harness directory, not the working directory.
+LIBRARY_DIR = os.environ["HARNESS_LIBRARY_DIR"]
 
 proto_in = os.fdopen(os.dup(0), "r", encoding="utf-8")
 proto_out = os.fdopen(os.dup(1), "w", encoding="utf-8")

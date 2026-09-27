@@ -4,7 +4,7 @@ Terminal chat client for an OpenAI-compatible chat completions endpoint, with on
 
 ## Files
 
-All paths are relative to the working directory.
+All paths are relative to the harness directory, `~/.harness` (home directory from the OS; not found is an error before the TUI starts), shared by every working directory. The working directory is only where the REPL runs and the classifier's repository root.
 
 - `config.toml`:
   ```toml
@@ -26,7 +26,7 @@ All paths are relative to the working directory.
   ```
   Unknown keys are rejected. A missing or invalid config, or an `api_key_env` naming an unset variable, is an error before the TUI starts. Shift+Tab rewrites only `approval_mode` (creating `[repl]` if missing), and `/tool-reasoning` only `tool_reasoning` (creating `[chat]` if missing), preserving the rest of the file.
 - `.env`: read if present, only to resolve `api_key_env`; shell variables take precedence. It is never added to the process environment, so the REPL doesn't inherit it. No permission checks; the app never edits `.gitignore`.
-- `sessions/YYYYMMDD-HHMMSS.json` (local time): `{ "messages": [...] }`. Created on first save. Every save writes a synced temp file and renames it over the session file.
+- `sessions/<name>.json`: `{ "messages": [...] }`. A new session's name is its start time, `YYYYMMDD-HHMMSS` (local time); `/rename` changes it. Valid names are non-empty, without `/`, and don't start with `.`. Created on first save. Every save writes a synced temp file and renames it over the session file.
 - `replib/*.py`: optional REPL function library (see REPL).
 
 ## Messages
@@ -39,7 +39,7 @@ All paths are relative to the working directory.
 - Every tool call in a saved assistant message is followed by exactly one tool message before the next request.
 - Messages are only removed by the per-turn `FYI()`/`help()` cleanup (see Tool calling).
 - Errors and classifier verdicts are shown in the transcript and never saved.
-- `--resume <PATH>` loads the file, shows the whole conversation, and appends to the same file. A missing or unparseable file is an error before the TUI starts. Any tool call without a result gets `[not run: turn stopped]`, inserted after its call's existing results and saved at once, with a line printed to the normal screen before the TUI starts (visible after exit).
+- `--resume` without a name prints the session names, one per line, by file modification time, oldest first, and exits without loading the config or starting the TUI. `--resume <NAME>` loads `sessions/<NAME>.json`, shows the whole conversation, and appends to the same file. An invalid name or a missing or unparseable file is an error before the TUI starts. Any tool call without a result gets `[not run: turn stopped]`, inserted after its call's existing results and saved at once, with a line printed to the normal screen before the TUI starts (visible after exit).
 
 ## Requests
 
@@ -78,7 +78,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 - `python3 -u -c <embedded driver>` from `PATH`, in the working directory, as the user, unsandboxed. The driver first calls `setsid()`: it has no controlling terminal (programs opening `/dev/tty` fail immediately), and it leads a process group that is killed as a whole. Started by a turn's first call (the synthetic `FYI()`, so every turn), reused for the turn's later calls, killed when the turn ends. If it dies mid-call, the result ends with `[REPL process exited: …]` and the next call starts a new process.
 - Protocol: JSON lines over the process's original stdin/stdout. Host sends `{"code", "prompt_tokens"}` (the latest `usage.prompt_tokens` or `null`, stored for `FYI()`); driver sends `{"output"}` chunks as written, then `{"done": true, "value", "error"}`. The code's stdin is `/dev/null`, and its fds 1 and 2 (inherited by subprocesses) go to a pipe the driver reads.
 - Code runs in one namespace per process. A trailing expression's value is returned and bound to `_`. `exit()` doesn't end the REPL.
-- `replib/*.py` are executed in sorted order at startup with `register` in scope; `@register` adds a function to the namespace and to `help()`. Load errors are printed in the first call's output.
+- `replib/*.py` (in the harness directory; the driver gets its absolute path as `HARNESS_LIBRARY_DIR`) are executed in sorted order at startup with `register` in scope; `@register` adds a function to the namespace and to `help()`. Load errors are printed in the first call's output.
 - `help()` prints the output limit, then each registered function's signature and docstring, or `No registered functions.`. `help(obj)` is Python's `help`.
 
 ## Terminal UI
@@ -103,7 +103,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 | Key | Action |
 |---|---|
-| Enter | Send (ignored when blank); with the completion list open, run the highlighted command |
+| Enter | Send (ignored when blank); with the completion list open, run the highlighted command (or complete one that takes an argument; see Commands) |
 | ^J | Insert newline |
 | ^K | Delete to end of line; at end of line, join the next line |
 | ^U | Delete to start of line; at start of line, join the previous line |
@@ -121,8 +121,10 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 - Input starting with `/` is a command. A leading space sends a literal `/`.
 - Completion list: shown below the input in place of the status line while the input is one line starting with `/` without whitespace, some command's name or alias starts with it, and no approval prompt is showing. One row per matching command (by name if it matches, else by its first matching alias) with its description; the first is highlighted, and any edit highlights the first again. At most 8 rows, scrolling with the highlight. Esc closes it until the input changes. Commands are defined once, in `src/commands.rs`, for both running and completion; the list order puts `/exit` last.
-- `/exit`, `/quit`: exit.
+- A command is its name or alias, then optionally whitespace and an argument (trimmed). Only commands that take an argument match input with one. Enter on a highlighted command that takes an argument completes it followed by a space instead of running it.
+- `/rename <name>`: rename the session file to `sessions/<name>.json` (before the first save, only the name it will be created under). An invalid or existing name shows the notice `couldn't rename: <error>` and keeps the input; the current name is a no-op.
 - `/tool-reasoning`: switch tool reasoning on or off and save it to `config.toml`. The transcript and the next request change at once.
+- `/exit`, `/quit`: exit.
 - Unknown command: notice `unknown command: <input>`; the input is kept.
 - During a turn, the input stays editable and commands run. Enter on a message shows the notice `turn in progress (esc to stop)` and keeps the draft.
 
@@ -130,16 +132,16 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 | File | Role |
 |---|---|
-| `src/main.rs` | Arguments, config and session loading |
+| `src/main.rs` | Arguments, session listing, config and session loading |
 | `src/app.rs` | Event loop, turn state machine, streaming display, saving, status line |
 | `src/tui.rs` | Alternate screen, mouse capture, screen layout, synchronized updates, clipboard |
 | `src/transcript.rs` | Transcript view: word wrap, scrolling, selection |
 | `src/input.rs` | Textarea setup, key map, paste |
-| `src/commands.rs` | Command table: names, aliases, descriptions, actions |
+| `src/commands.rs` | Command table: names, aliases, descriptions, actions, arguments |
 | `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, classifier request |
 | `src/repl.rs` | REPL process lifecycle and protocol |
 | `src/repl_driver.py` | Embedded Python driver |
-| `src/config.rs` | `config.toml` (including `approval_mode` and `tool_reasoning` persistence) and `.env` |
-| `src/session.rs` | Message types and session file I/O |
+| `src/config.rs` | Harness directory, `config.toml` (including `approval_mode` and `tool_reasoning` persistence) and `.env` |
+| `src/session.rs` | Message types, session file I/O, listing, renaming |
 | `src/tool_reasoning.rs` | Tool reasoning conversion and the `reasoning()` approval exemption |
 | `replib/reasoning.py` | `reasoning()` library function |

@@ -22,6 +22,7 @@ Working log. Behavior contract: `SPEC.md`.
 16. **Endpoint-neutral replies.** Each streamed `delta` is merged whole by the OpenAI SDK's `accumulate_delta` rule, and every field is saved and sent back unchanged, so any endpoint's reasoning format (`reasoning`, `reasoning_content`, `reasoning_details`) round-trips. Only display picks known reasoning fields.
 17. **Tool reasoning (experimental).** `[chat] tool_reasoning` / `/tool-reasoning`: earlier turns' reasoning is sent and drawn as synthetic `reasoning("…")` calls with `(no output)` results, built per request from the unchanged session. First library function, `replib/reasoning.py`: a no-op the model is meant to call, listed by `help()`, exempt from approval when called on a plain string literal.
 18. **Command completion.** Typing `/` lists matching commands (name, description) below the input in place of the status line; Up/Down, Tab, Enter, Esc. One command table (`src/commands.rs`) drives both completion and running.
+19. **Harness directory.** `config.toml`, `.env`, `sessions/`, and `replib/` live in `~/.harness`, so the app runs in any repo. Sessions are flat and named by file name: `/rename <name>` (first command with an argument), `--resume` lists names, `--resume <NAME>` resumes.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
@@ -39,12 +40,12 @@ Decided against:
 
 ## Open
 
-- Two instances started in the same second share a session file name and overwrite each other.
+- Two instances started in the same second, in any repos, share a session file name and overwrite each other.
 - Process-group kill uses `/bin/kill` to avoid a direct `libc` dependency.
 - `serde_json` lacks `preserve_order`, so kept fields are saved and sent back with object keys sorted (values unchanged). Fix: enable the feature in `Cargo.toml`.
 - `SPEC.md` exempts synthetic calls from approval; the code still exempts `FYI()`/`help()`-only code and is updated with AGENTS.md.
 
 ## Reference
 
-- Run: `cargo run` from the repo root; `cargo run -- --resume sessions/<file>.json`.
+- Run: `harness` (`target/debug/` on `PATH`) from the target repo, with `~/.harness` symlinked to this repo during development; `harness --resume [NAME]`.
 - Python audit hooks (PEP 578) report `open`, `os.remove`/`rename`, `subprocess.Popen`, `os.system`, `socket.connect`, `ctypes.*`, and `import` events with real arguments; not a security boundary.

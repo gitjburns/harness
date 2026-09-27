@@ -10,7 +10,9 @@ The app runs full screen and draws the conversation exactly as the model sees it
 
 Requires a Rust toolchain and `python3` on your `PATH`.
 
-Create `config.toml` in the directory you run from, normally the root of the repository you want the agent to work in:
+The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, and `replib/` (see Library functions). They are shared by every repository you run it in. `~/.harness` can be a symlink to a checkout of this repo.
+
+Create `~/.harness/config.toml`:
 
 ```toml
 [endpoint]
@@ -34,7 +36,7 @@ approval_mode = "auto"           # allow | ask | auto
 output_limit = 100000            # bytes of output per call returned to the model
 ```
 
-If the endpoint needs a key, put it in `.env` in the same directory (and keep that file out of version control):
+If the endpoint needs a key, put it in `~/.harness/.env` (and keep that file out of version control):
 
 ```
 OPENAI_API_KEY=sk-...
@@ -44,14 +46,13 @@ A variable already set in your shell takes precedence over `.env`.
 
 ## Running
 
-```
-cargo run
-```
+Build with `cargo build`, then run `harness` (in `target/debug/`) from the directory the agent should work in, normally the root of a repository.
 
-Each run starts a new conversation, saved to `sessions/YYYYMMDD-HHMMSS.json` when you send the first message. To continue an earlier conversation:
+Each run starts a new conversation, saved to `~/.harness/sessions/YYYYMMDD-HHMMSS.json` when you send the first message. The file name without `.json` is the session's name; `/rename <name>` changes it. To list saved sessions, oldest first, or continue one:
 
 ```
-cargo run -- --resume sessions/20260925-143012.json
+harness --resume
+harness --resume 20260925-143012
 ```
 
 The earlier conversation is shown, and new messages are added to the same file.
@@ -103,10 +104,11 @@ When you scroll up, the view stays put while the model writes; scroll back to th
 
 | Command | Action |
 |---|---|
-| `/exit`, `/quit` | Exit |
+| `/rename <name>` | Rename this session (its file in `~/.harness/sessions/`); refused if the name is taken |
 | `/tool-reasoning` | Turn tool reasoning on or off (saved to `config.toml`) |
+| `/exit`, `/quit` | Exit |
 
-Typing `/` opens a list of matching commands below the input: Up/Down to choose, Tab to complete, Enter to run, Esc to close.
+Typing `/` opens a list of matching commands below the input: Up/Down to choose, Tab to complete, Enter to run (for `/rename`, to complete it so you can type the name), Esc to close.
 
 To send a message that starts with `/`, begin it with a space.
 
@@ -116,7 +118,7 @@ REPL state (variables, imports) lasts for one turn: from your message until the 
 
 ### Library functions
 
-Library functions are Python functions you provide for the model. They live in `replib/`, one or more `.py` files in the directory you run from, loaded in name order at the start of every turn. The model learns about them only from `help()`, which lists each one's signature and docstring.
+Library functions are Python functions you provide for the model. They live in `~/.harness/replib/`, one or more `.py` files, loaded in name order at the start of every turn. The model learns about them only from `help()`, which lists each one's signature and docstring.
 
 **Adding one.** Put it in any file in `replib/` and mark it with `@register` (no import needed):
 
@@ -134,7 +136,7 @@ def word_count(path):
 
 **Mistakes.** If a file fails to load, its error appears in the output of the turn's first call (the app's own `FYI()`), so you and the model both see it; the other files still load.
 
-This repo ships one library function, `replib/reasoning.py`:
+This repo ships one library function, `replib/reasoning.py` (used when `~/.harness` links to this repo; otherwise copy it into `~/.harness/replib/`):
 
 - `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
 - That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing. Edit its docstring freely (it's what `help()` shows the model), but not its behavior.
