@@ -378,12 +378,17 @@ impl App {
             Ok(code) => code,
             Err(error) => return self.record_result(&call, error),
         };
+        // `reasoning()` is a no-op the model is meant to call freely, so the call is
+        // answered here without approval and without running: in the REPL, `reasoning`
+        // is whatever the turn's earlier code bound it to, which could be anything.
+        // Kept out of `is_exempt`, which also selects the calls the per-turn cleanup
+        // removes.
+        if tool_reasoning::is_reasoning_call(&code) {
+            return self.record_result(&call, tool_reasoning::RESULT.to_string());
+        }
         let call = PendingCall { call, code };
         let phase = match self.settings.approval_mode {
             _ if is_exempt(&call.code) => Phase::Ready(call),
-            // A no-op the model is meant to call freely. Kept out of `is_exempt`, which
-            // also selects the calls the per-turn cleanup removes.
-            _ if tool_reasoning::is_reasoning_call(&call.code) => Phase::Ready(call),
             ApprovalMode::Allow => Phase::Ready(call),
             ApprovalMode::Ask => Phase::Approving {
                 call,

@@ -1,12 +1,12 @@
 [endpoint]
 base_url = "http://10.1.0.10:8000/v1"
-#model = "DeepSeek-V4-Flash-0731"
-model = "Qwen3.8-27B"
+model = "DeepSeek-V4-Flash-0731"
+#model = "Qwen3.8-27B"
 #api_key_env = "OPENAI_API_KEY"
 
 [chat]
-prompt = """FYI() and help() are synthetic tool calls injected into your context for your benefit. FYI() provides situational awareness - The date and time, your prompt tokens, and your which model you're running. help() lists any custom Python functions that are available."""
-tool_reasoning = true
+#prompt = """FYI() and help() are synthetic tool calls injected into your context for your benefit. FYI() provides situational awareness - The date and time, your prompt tokens, and your which model you're running. help() lists any custom Python functions that are available."""
+tool_reasoning = false
 
 [classifier]
 prompt = """

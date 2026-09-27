@@ -78,7 +78,7 @@ Shift+Tab cycles the mode; the choice is saved to `config.toml`.
 | `auto` | A separate request to the model judges the code against `[classifier] prompt`. Safe code runs, unsafe code is blocked, and anything else asks you. |
 | `allow` | Every call runs without asking. |
 
-A call that is only `reasoning("...")` on a plain string never needs approval, in any mode (see Library functions).
+A call that is only `reasoning("...")` on a plain string never needs approval, in any mode, and always succeeds (see Library functions).
 
 ### Keys
 
@@ -136,8 +136,8 @@ def word_count(path):
 
 This repo ships one library function, `replib/reasoning.py`:
 
-- `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval.
-- Tool reasoning (below) depends on it staying a no-op that prints nothing. Edit its docstring freely, but not its behavior.
+- `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
+- That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing. Edit its docstring freely (it's what `help()` shows the model), but not its behavior.
 
 ## Tool reasoning
 

@@ -17,7 +17,8 @@ use crate::session::{Message, Role};
 /// Native reasoning fields removed from a converted message.
 const REASONING_FIELDS: [&str; 3] = ["reasoning", "reasoning_content", "reasoning_details"];
 
-/// What `reasoning()` produces: nothing, which the REPL reports this way.
+/// What `reasoning()` produces: nothing, which the REPL reports this way. Also the
+/// result of every exact `reasoning("…")` call, which is answered without running.
 pub const RESULT: &str = "(no output)";
 
 /// Index of the turn in progress's user message. Messages before it are converted.
