@@ -4,9 +4,9 @@ Working log. Behavior contract: `SPEC.md`.
 
 ## Done
 
-1. **Terminal layer spike.** Raw transcript in scrollback plus an app-managed bottom input region; resize via the parked hidden cursor; bracketed paste.
+1. **Terminal layer spike.** Raw transcript in scrollback plus an app-managed bottom input region; resize via the parked hidden cursor; bracketed paste. Scrollback and cursor parts superseded by 15.
 2. **Chat app.** `config.toml` and `.env`, session files with atomic writes, SSE streaming client, `/exit` and `/quit`, Esc to stop, `--resume <PATH>`.
-3. **Review fixes.** Status line erased at screen bottom; partial reply lost on error paths; raw mode left on failed startup; stale pending-line row after scroll; per-delta cursor-query lag (deltas coalesced, input poll 20 ms); resize ordering (`biased` select); temp file fsync.
+3. **Review fixes.** Status line erased at screen bottom; partial reply lost on error paths; raw mode left on failed startup; stale pending-line row after scroll; per-delta cursor-query lag (deltas coalesced, input poll 20 ms); resize ordering (`biased` select); temp file fsync. Scrollback-specific fixes superseded by 15.
 4. **Flicker fix.** Synchronized updates per frame.
 5. **Reasoning.** Streamed as `delta.reasoning`, displayed dim, saved as `reasoning`, sent back.
 6. **Input prompt.** Bright white `> ` in the input box.
@@ -15,10 +15,11 @@ Working log. Behavior contract: `SPEC.md`.
 9. **Tool-calling hardening (review).** Results recorded before terminal I/O; driver `setsid()` (no controlling tty); request-reader thread; driver survives closed stdout; config save keeps decor, handles inline tables, atomic; `finish_reason: "length"` drops cut-off calls; SIGHUP/SIGTERM/SIGINT cleanup; resume answers unanswered calls; `.env` read privately.
 10. **Situational awareness.** Each turn opens with synthetic `FYI()` and `help()` REPL calls, run in the REPL like any other (honesty rule: synthetic calls must work when made explicitly). `FYI()` is implemented only in the driver: date, latest `prompt_tokens` (sent with every code request), model.
 11. **Approval exemption.** Code made only of `FYI()` and `help()` statements never needs approval.
-12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling.
+12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling. Superseded by 15.
 13. **Synthetic-call cleanup.** Each turn removes all earlier `FYI()`/`help()`-only calls (and results, and emptied assistant messages) from the session before adding its own, so exactly one of each is in context. First case of the app removing messages.
 14. **Chat system message.** Optional `[chat] prompt`, prepended to each chat request at send time and never saved, so the current config applies to resumed sessions.
 15. **App-managed scrollback.** Alternate screen with mouse capture; the transcript is drawn each frame from the system message, messages, the turn in progress, and display-only notes, so it always matches the model's context. App word wrap, scrolling (follow at bottom, PageUp/PageDown, wheel), drag selection with OSC 52 copy on release.
+16. **Endpoint-neutral replies.** Each streamed `delta` is merged whole by the OpenAI SDK's `accumulate_delta` rule, and every field is saved and sent back unchanged, so any endpoint's reasoning format (`reasoning`, `reasoning_content`, `reasoning_details`) round-trips. Only display picks known reasoning fields.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
@@ -37,12 +38,10 @@ Decided against:
 
 - Two instances started in the same second share a session file name and overwrite each other.
 - Process-group kill uses `/bin/kill` to avoid a direct `libc` dependency.
+- `serde_json` lacks `preserve_order`, so kept fields are saved and sent back with object keys sorted (values unchanged). Fix: enable the feature in `Cargo.toml`.
 - `SPEC.md` exempts synthetic calls from approval; the code still exempts `FYI()`/`help()`-only code and is updated with AGENTS.md.
 
 ## Reference
 
 - Run: `cargo run` from the repo root; `cargo run -- --resume sessions/<file>.json`.
-- Endpoint: vLLM 0.30.0 at `http://10.1.0.10:8000/v1`, model `DeepSeek-V4-Flash-0731`, `max_model_len` 550000, no API key.
-- The model's chat template renders assistant `reasoning` only after the last user message (checked with `/tokenize`). `reasoning_content` is ignored on input.
-- The endpoint accepts tool calls with truncated (invalid JSON) `arguments`; other endpoints may not, hence dropping them.
 - Python audit hooks (PEP 578) report `open`, `os.remove`/`rename`, `subprocess.Popen`, `os.system`, `socket.connect`, `ctypes.*`, and `import` events with real arguments; not a security boundary.

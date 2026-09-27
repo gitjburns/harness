@@ -65,7 +65,7 @@ The status line under the prompt shows the model, the number of tokens in use (a
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
-**Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (`n/a` before the first), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context. Code made only of `FYI()` and `help()` never needs approval, in any mode.
+**Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context. The app's own `FYI()` and `help()` calls never need approval, in any mode; when the model calls them itself, the call is approved like any other.
 
 ### Approval modes
 
@@ -131,4 +131,4 @@ Session files hold the conversation exactly as it is sent to the model, includin
 ] }
 ```
 
-A reply you stop partway through is kept as far as it got. Errors and safety verdicts appear on screen but are not saved.
+Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …), and send them back unchanged. A reply you stop partway through is kept as far as it got. Errors and safety verdicts appear on screen but are not saved.

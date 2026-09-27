@@ -16,7 +16,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEve
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui_textarea::TextArea;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
@@ -25,7 +25,7 @@ use crate::client::{self, StreamEvent, Verdict, VerdictKind};
 use crate::config::{self, ApprovalMode, Settings};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent};
-use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall};
+use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
 use crate::transcript::{Block, Key, View};
 use crate::tui::{self, Tui};
 
@@ -121,16 +121,9 @@ struct PendingCall {
 struct Reply {
     task: JoinHandle<()>,
     events: UnboundedReceiver<StreamEvent>,
-    reasoning: String,
-    content: String,
-    calls: Vec<PartialCall>,
-}
-
-#[derive(Default)]
-struct PartialCall {
-    id: Option<String>,
-    name: Option<String>,
-    arguments: String,
+    /// The message assembled from the deltas so far (`client::accumulate`), every
+    /// field as the endpoint sent it.
+    fields: Map<String, Value>,
 }
 
 /// A line shown in the transcript but never sent to the model.
@@ -257,9 +250,7 @@ impl App {
             turn.phase = Phase::Streaming(Reply {
                 task,
                 events,
-                reasoning: String::new(),
-                content: String::new(),
-                calls: Vec::new(),
+                fields: Map::new(),
             });
         }
     }
@@ -277,24 +268,7 @@ impl App {
         let mut event = Some(event);
         while let Some(current) = event.take() {
             match current {
-                StreamEvent::Reasoning(text) => reply.reasoning.push_str(&text),
-                StreamEvent::Content(text) => reply.content.push_str(&text),
-                StreamEvent::ToolCall {
-                    index,
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    // Tool calls aren't displayed while streaming; they appear once
-                    // the reply is saved.
-                    if reply.calls.len() <= index {
-                        reply.calls.resize_with(index + 1, PartialCall::default);
-                    }
-                    let call = &mut reply.calls[index];
-                    call.id = call.id.take().or(id);
-                    call.name = call.name.take().or(name);
-                    call.arguments.push_str(&arguments);
-                }
+                StreamEvent::Delta(delta) => client::accumulate(&mut reply.fields, delta),
                 StreamEvent::Usage { total, prompt } => {
                     self.context_tokens = Some(total);
                     if let Some(prompt) = prompt {
@@ -331,44 +305,50 @@ impl App {
 
     /// Save the response as an assistant message. Returns its complete tool calls and
     /// the save result (the message is in the session either way; a failed save is
-    /// retried by the next one). When `interrupted`, a call whose arguments aren't
-    /// valid JSON was still streaming and is dropped; it never ran, so nothing it did
-    /// needs recording.
+    /// retried by the next one). Every field the endpoint sent is kept, so it gets
+    /// its own format back. A call without an id or name is dropped, and when
+    /// `interrupted`, so is a call whose arguments aren't valid JSON: it was still
+    /// streaming and never ran, so nothing it did needs recording.
     fn save_reply(
         &mut self,
         reply: Reply,
         interrupted: bool,
     ) -> (Vec<ToolCall>, anyhow::Result<()>) {
         reply.task.abort();
-        let calls: Vec<ToolCall> = reply
-            .calls
-            .into_iter()
-            .filter_map(|p| {
-                let (id, name) = (p.id?, p.name?);
-                if interrupted && serde_json::from_str::<Value>(&p.arguments).is_err() {
-                    return None;
-                }
-                Some(ToolCall {
-                    id,
-                    kind: "function".to_string(),
-                    function: FunctionCall {
-                        name,
-                        arguments: p.arguments,
-                    },
-                })
-            })
-            .collect();
-        let has_text = !reply.reasoning.is_empty() || !reply.content.is_empty();
-        let saved = if has_text || !calls.is_empty() {
-            self.session.push(Message {
-                role: Role::Assistant,
-                content: reply.content,
-                reasoning: (!reply.reasoning.is_empty()).then_some(reply.reasoning),
-                tool_calls: (!calls.is_empty()).then(|| calls.clone()),
-                ..Default::default()
-            })
-        } else {
+        let mut fields = reply.fields;
+        // The role is known, and `content` and `tool_calls` have typed homes; the rest
+        // stays as streamed.
+        fields.remove("role");
+        let content = match fields.remove("content") {
+            Some(Value::String(content)) => content,
+            _ => String::new(),
+        };
+        let calls: Vec<ToolCall> = match fields.remove("tool_calls") {
+            Some(Value::Array(calls)) => calls,
+            _ => Vec::new(),
+        }
+        .into_iter()
+        .filter_map(|mut call| {
+            // `index` only orders fragments within the stream.
+            call.as_object_mut()?.remove("index");
+            let call: ToolCall = serde_json::from_value(call).ok()?;
+            if interrupted && serde_json::from_str::<Value>(&call.function.arguments).is_err() {
+                return None;
+            }
+            Some(call)
+        })
+        .collect();
+        let message = Message {
+            role: Role::Assistant,
+            content,
+            tool_calls: (!calls.is_empty()).then(|| calls.clone()),
+            extra: fields,
+            ..Default::default()
+        };
+        let saved = if message.is_empty() {
             Ok(())
+        } else {
+            self.session.push(message)
         };
         (calls, saved)
     }
@@ -835,8 +815,12 @@ fn build_blocks<'a>(
                 blocks.push(blank(part(1)));
             }
             Role::Assistant => {
-                if let Some(reasoning) = &message.reasoning {
-                    blocks.push(Block::new(part(0), reasoning.as_str(), reasoning_style()));
+                // Only reasoning, content, and calls are drawn; other fields are sent
+                // back but have no display form.
+                let reasoning = message.reasoning();
+                let has_reasoning = reasoning.is_some();
+                if let Some(reasoning) = reasoning {
+                    blocks.push(Block::new(part(0), reasoning, reasoning_style()));
                     if !message.content.is_empty() {
                         blocks.push(blank(part(1)));
                     }
@@ -844,7 +828,7 @@ fn build_blocks<'a>(
                 if !message.content.is_empty() {
                     blocks.push(Block::new(part(2), message.content.as_str(), plain()));
                 }
-                if message.reasoning.is_some() || !message.content.is_empty() {
+                if has_reasoning || !message.content.is_empty() {
                     blocks.push(blank(part(3)));
                 }
                 for call in message.tool_calls.iter().flatten() {
@@ -883,16 +867,19 @@ fn build_blocks<'a>(
 
     // Keyed as the message it will be saved as, so saving it changes no keys.
     if let Some(Phase::Streaming(reply)) = phase {
+        // Tool calls aren't drawn while streaming; they appear once the reply is saved.
         let part = |n| Key::Message(messages.len(), n);
-        if !reply.reasoning.is_empty() {
-            let reasoning = reply.reasoning.as_str();
+        let reasoning = reasoning_text(&reply.fields);
+        let has_reasoning = reasoning.is_some();
+        if let Some(reasoning) = reasoning {
             blocks.push(Block::new(part(0), reasoning, reasoning_style()));
         }
-        if !reply.content.is_empty() {
-            if !reply.reasoning.is_empty() {
+        let content = reply.fields.get("content").and_then(Value::as_str);
+        if let Some(content) = content.filter(|content| !content.is_empty()) {
+            if has_reasoning {
                 blocks.push(blank(part(1)));
             }
-            blocks.push(Block::new(part(2), reply.content.as_str(), plain()));
+            blocks.push(Block::new(part(2), content, plain()));
         }
     }
     blocks
@@ -917,7 +904,9 @@ fn fyi_calls() -> Vec<ToolCall> {
             function: FunctionCall {
                 name: "REPL".to_string(),
                 arguments: format!(r#"{{"code": "{code}"}}"#),
+                extra: Map::new(),
             },
+            extra: Map::new(),
         })
         .collect()
 }

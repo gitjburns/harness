@@ -10,7 +10,7 @@ All paths are relative to the working directory.
   ```toml
   [endpoint]
   base_url = "http://host:8000/v1"   # requests go to {base_url}/chat/completions; trailing `/` trimmed
-  model = "DeepSeek-V4-Flash-0731"
+  model = "your-model-name"
   api_key_env = "OPENAI_API_KEY"     # optional: names the variable holding the key; omitted = no Authorization header
 
   [chat]                             # optional
@@ -32,9 +32,9 @@ All paths are relative to the working directory.
 
 - `messages` is exactly the array sent to the endpoint, after the system message. The system message is `[chat] prompt` as currently configured, added at send time and never saved.
   - user: `{"role": "user", "content"}`
-  - assistant: `{"role": "assistant", "content", "reasoning"?, "tool_calls"?}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`
+  - assistant: `{"role": "assistant", "content", "tool_calls"?, ...}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`. Every other field the endpoint streamed (reasoning under whatever name it uses, and unknown fields, here and inside tool calls) is kept and sent back unchanged.
   - tool: `{"role": "tool", "tool_call_id", "content"}`
-- The user message is saved on send. An assistant message is saved once when its response ends (completed, Esc, error, `/exit`, or app exit), with whatever content, reasoning, and complete tool calls arrived, if any is non-empty. A tool call still streaming when the response is interrupted or cut off at the token limit (`finish_reason: "length"`), meaning its arguments aren't valid JSON, is dropped.
+- The user message is saved on send. An assistant message is saved once when its response ends (completed, Esc, error, `/exit`, or app exit), with every field that arrived, if any (besides `role`) has a value; `null`, `""`, `[]`, and `{}` don't count. A tool call without an `id` or `function.name` is dropped. A tool call still streaming when the response is interrupted or cut off at the token limit (`finish_reason: "length"`), meaning its arguments aren't valid JSON, is dropped.
 - Every tool call in a saved assistant message is followed by exactly one tool message before the next request.
 - Messages are only removed by the per-turn `FYI()`/`help()` cleanup (see Tool calling).
 - Errors and classifier verdicts are shown in the transcript and never saved.
@@ -43,7 +43,7 @@ All paths are relative to the working directory.
 ## Requests
 
 - Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured. `messages` starts with `{"role": "system", "content": [chat] prompt}` when configured.
-- SSE `data:` lines: `delta.reasoning` is reasoning, `delta.content` is content, `delta.tool_calls` are tool call fragments (by `index`; `id` and `function.name` once, `function.arguments` appended), `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
+- SSE `data:` lines: each `delta` is merged into the reply by the OpenAI SDK's `accumulate_delta` rule, whatever its fields: strings appended, numbers added, objects merged recursively, lists of entries with an `index` merged by matching `index` value (a fragment without one is appended), other lists extended; `index` and `type` are replaced; a value of a different type (such as a later `null`) is ignored. `role` is always `assistant`; `index` is removed from saved tool calls. `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
 - Classifier: non-streaming request to the same endpoint and model. System message: `[classifier] prompt`. User message: `Repository root: <absolute working directory>` and the code in a fenced block. `response_format` is a strict JSON schema `{"effects": string, "verdict": "safe" | "unsafe" | "inconclusive"}`, both required, in that order.
 
 ## Tool calling
@@ -52,7 +52,7 @@ All paths are relative to the working directory.
   - name `REPL`, one required string parameter `code`
   - description: "Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries."
 - A turn starts with a user message. Each response's tool calls are handled in order, their results are sent, and the next response is requested. The turn ends when a response has no tool calls, on Esc, or on a stream error.
-- **Situational awareness.** Each turn opens with synthetic calls. First, every earlier `REPL` call whose code is made only of `FYI()`/`help()` statements (synthetic or the model's own) is removed with its result; an assistant message left with no calls, content, or reasoning is removed too, and the session is saved. Then, after the user message, the app saves an assistant message with two `REPL` calls, `{"code": "FYI()"}` and `{"code": "help()"}` (ids `fyi-<unix millis>-<counter>`), and runs them in the REPL like any other calls, before the first request. So the context always holds exactly one environment snapshot and one library listing: the current turn's. `FYI()` is the driver's only snapshot implementation; it prints `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens, or n/a>`, and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `FYI()` is not in the registry, so `help()` doesn't list it.
+- **Situational awareness.** Each turn opens with synthetic calls. First, every earlier `REPL` call whose code is made only of `FYI()`/`help()` statements (synthetic or the model's own) is removed with its result; an assistant message left with no calls, content, or other field with a value is removed too, and the session is saved. Then, after the user message, the app saves an assistant message with two `REPL` calls, `{"code": "FYI()"}` and `{"code": "help()"}` (ids `fyi-<unix millis>-<counter>`), and runs them in the REPL like any other calls, before the first request. So the context always holds exactly one environment snapshot and one library listing: the current turn's. `FYI()` is the driver's only snapshot implementation; it prints the lines `FYI()`, `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens>` (omitted until a response reports usage), and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `FYI()` is not in the registry, so `help()` doesn't list it.
 - Synthetic calls run without approval in every mode. Every other call is approved per `approval_mode`.
 - Approval, per `approval_mode` at the moment each call is handled:
   - `allow`: run.
@@ -75,10 +75,10 @@ All paths are relative to the working directory.
 ## Terminal UI
 
 - Full screen on the alternate screen, with mouse capture. On exit the terminal returns to its previous contents; nothing is left behind.
-- The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are.
+- The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are. Fields other than content, reasoning, and tool calls are sent but not shown.
   - System message (if configured): `system` (dim), then the prompt.
   - User message: `> text`, cyan.
-  - Assistant: reasoning dim, a blank line, then content in the default style.
+  - Assistant: reasoning dim, a blank line, then content in the default style. Reasoning is the first non-empty of `reasoning`, `reasoning_content`, and the `text` or `summary` of each `reasoning_details` entry (joined by blank lines).
   - Tool call: `REPL` (dim), the code, the verdict note, then the result, dim. A saved reply's calls all appear at once; running output appears live, in full.
   - A blank line follows each message and each tool call.
   - Notes are shown but never saved and are lost on exit: verdicts (`safe:` green, `unsafe:` red, `inconclusive:` or `classifier failed:` yellow; `auto` only) under their call, and errors (`error: ...`, red) where they happened. A verdict goes with its call when the call is removed; errors keep their place among the remaining messages.
@@ -87,7 +87,7 @@ All paths are relative to the working directory.
 - Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
 - Each frame is one synchronized update.
 - Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line. A click there only clears the selection.
-- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage), then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
+- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage; omitted until one has), then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
 ## Keys
@@ -123,7 +123,7 @@ All paths are relative to the working directory.
 | `src/tui.rs` | Alternate screen, mouse capture, screen layout, synchronized updates, clipboard |
 | `src/transcript.rs` | Transcript view: word wrap, scrolling, selection |
 | `src/input.rs` | Textarea setup, key map, paste |
-| `src/client.rs` | REPL tool definition, streaming request and SSE parsing, classifier request |
+| `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, classifier request |
 | `src/repl.rs` | REPL process lifecycle and protocol |
 | `src/repl_driver.py` | Embedded Python driver |
 | `src/config.rs` | `config.toml` (including `approval_mode` persistence) and `.env` |

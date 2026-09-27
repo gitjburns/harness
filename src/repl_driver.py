@@ -138,8 +138,12 @@ def _fyi():
     offset = time.strftime("%z", now)
     offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
     date = time.strftime("%a %b %d %H:%M:%S ", now) + offset + time.strftime(" %Y", now)
-    tokens = "n/a" if prompt_tokens is None else prompt_tokens
-    print(f"FYI()\nDate: {date}\nPrompt tokens: {tokens}\nModel: {MODEL}")
+    lines = ["FYI()", f"Date: {date}"]
+    # No count until a response has reported usage; omit the line rather than print a placeholder.
+    if prompt_tokens is not None:
+        lines.append(f"Prompt tokens: {prompt_tokens}")
+    lines.append(f"Model: {MODEL}")
+    print("\n".join(lines))
 
 
 namespace["FYI"] = _fyi

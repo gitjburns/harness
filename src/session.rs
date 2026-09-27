@@ -3,13 +3,16 @@
 //! Messages are appended, except that resume inserts results for
 //! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
 //! (`remove_calls`). Partial replies are kept as-is, except that a tool call still
-//! streaming when the reply ended is dropped.
+//! streaming when the reply ended is dropped. Assistant messages keep every field
+//! the endpoint streamed, including ones the app doesn't know.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 const SESSIONS_DIR: &str = "sessions";
 
@@ -29,16 +32,17 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
-    /// Assistant reasoning, sent back to the endpoint as-is. The field name is what
-    /// vLLM streams (`delta.reasoning`) and accepts on input messages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
     /// Complete tool calls made by an assistant message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// The call a `tool` message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Every other field of an assistant message, exactly as the endpoint streamed
+    /// it: reasoning under whatever name the endpoint uses, and fields the app doesn't
+    /// know. Sent back unchanged, so the endpoint gets its own format.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Message {
@@ -58,22 +62,80 @@ impl Message {
             ..Default::default()
         }
     }
+
+    /// Reasoning to display, from whichever field the endpoint used.
+    pub fn reasoning(&self) -> Option<Cow<'_, str>> {
+        reasoning_text(&self.extra)
+    }
+
+    /// Nothing worth keeping: no content, no calls, and no other field with a value.
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+            && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            && !self.extra.values().any(has_value)
+    }
+}
+
+/// Display text of the reasoning in an assistant message's fields: `reasoning`, else
+/// `reasoning_content`, else the text of the `reasoning_details` blocks (encrypted
+/// blocks have none). Endpoints that send more than one carry the same reasoning in
+/// each, so only one is shown.
+pub fn reasoning_text(fields: &Map<String, Value>) -> Option<Cow<'_, str>> {
+    for key in ["reasoning", "reasoning_content"] {
+        if let Some(text) = fields.get(key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(Cow::Borrowed(text));
+        }
+    }
+    let text = fields
+        .get("reasoning_details")?
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text").or_else(|| block.get("summary"))?.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(Cow::Owned(text))
+}
+
+/// Streams often carry placeholder fields (`"refusal": null`, `"reasoning": ""`);
+/// those alone don't make a message worth keeping.
+fn has_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ToolCall {
     pub id: String,
     /// Always `"function"`.
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "function_kind")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Fields the app doesn't use, kept as streamed and sent back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn function_kind() -> String {
+    "function".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FunctionCall {
     pub name: String,
     /// JSON-encoded arguments, exactly as the model produced them.
+    #[serde(default)]
     pub arguments: String,
+    /// Fields the app doesn't use, kept as streamed and sent back unchanged.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -160,8 +222,8 @@ impl Session {
     }
 
     /// Remove every tool call matching `matches`, with its tool result, and save if
-    /// anything changed. An assistant message left with no calls, content, or
-    /// reasoning is removed too; one that still has any of them stays without the
+    /// anything changed. An assistant message left empty (`Message::is_empty`) is
+    /// removed too; one that still has content or another field stays without the
     /// call. Returns the pre-removal indices of the removed messages, ascending.
     pub fn remove_calls(
         &mut self,
@@ -182,7 +244,7 @@ impl Session {
             });
             if calls.is_empty() {
                 message.tool_calls = None;
-                *emptied = message.content.is_empty() && message.reasoning.is_none();
+                *emptied = message.is_empty();
             }
         }
         if removed_ids.is_empty() {

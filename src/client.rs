@@ -4,7 +4,7 @@
 use anyhow::{Context, bail};
 use futures::StreamExt;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Number, Value, json};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -33,27 +33,15 @@ fn repl_tool() -> Value {
 }
 
 pub enum StreamEvent {
-    Content(String),
-    Reasoning(String),
-    /// A fragment of tool call `index`. The id and name arrive once, typically in the
-    /// first fragment; `arguments` is a piece of the JSON arguments string.
-    ToolCall {
-        index: usize,
-        id: Option<String>,
-        name: Option<String>,
-        arguments: String,
-    },
+    /// One chunk's `delta`, every field as sent. The reply is assembled from these
+    /// with `accumulate`.
+    Delta(Map<String, Value>),
     /// Usage from the final usage chunk: `total` is prompt + completion, `prompt` is
     /// the prompt alone, sent back to the model as the next turn's FYI count.
-    Usage {
-        total: u64,
-        prompt: Option<u64>,
-    },
+    Usage { total: u64, prompt: Option<u64> },
     /// The reply finished normally. `truncated` means it stopped at the token limit
     /// (`finish_reason: "length"`), so a tool call may have been cut off mid-stream.
-    Done {
-        truncated: bool,
-    },
+    Done { truncated: bool },
     /// The request or stream failed. Deltas already sent remain part of the reply.
     Error(String),
 }
@@ -123,44 +111,21 @@ async fn stream(
             if data == "[DONE]" {
                 return Ok(finish_reason.as_deref() == Some("length"));
             }
-            let chunk: Value = serde_json::from_str(data)
+            let mut chunk: Value = serde_json::from_str(data)
                 .with_context(|| format!("parsing stream data: {data}"))?;
             if let Some(error) = chunk.get("error") {
                 bail!("{error}");
             }
-            let choice = &chunk["choices"][0];
-            let delta = &choice["delta"];
-            let events = [
-                (
-                    "reasoning",
-                    StreamEvent::Reasoning as fn(String) -> StreamEvent,
-                ),
-                ("content", StreamEvent::Content),
-            ];
-            for (field, event) in events {
-                if let Some(text) = delta[field].as_str()
-                    && !text.is_empty()
-                    && tx.send(event(text.to_string())).is_err()
-                {
-                    return Ok(false); // Receiver dropped: the request was cancelled.
-                }
-            }
-            for call in delta["tool_calls"].as_array().into_iter().flatten() {
-                let event = StreamEvent::ToolCall {
-                    index: call["index"].as_u64().unwrap_or(0) as usize,
-                    id: call["id"].as_str().map(str::to_string),
-                    name: call["function"]["name"].as_str().map(str::to_string),
-                    arguments: call["function"]["arguments"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                };
-                if tx.send(event).is_err() {
-                    return Ok(false);
-                }
-            }
-            if let Some(reason) = choice["finish_reason"].as_str() {
+            if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
                 finish_reason = Some(reason.to_string());
+            }
+            // The final usage chunk has no choices, hence `pointer_mut`.
+            if let Some(Value::Object(delta)) =
+                chunk.pointer_mut("/choices/0/delta").map(Value::take)
+                && !delta.is_empty()
+                && tx.send(StreamEvent::Delta(delta)).is_err()
+            {
+                return Ok(false); // Receiver dropped: the request was cancelled.
             }
             if let Some(total) = chunk["usage"]["total_tokens"].as_u64()
                 && tx
@@ -178,6 +143,80 @@ async fn stream(
     match finish_reason {
         Some(reason) => Ok(reason == "length"),
         None => bail!("stream ended before the reply finished"),
+    }
+}
+
+/// Merge a streamed `delta` into the message assembled so far, by the OpenAI SDK's
+/// rule (`accumulate_delta`): strings are appended, numbers added, objects merged
+/// recursively, and lists of entries with an `index` merged entry by entry. `index`
+/// and `type` are replaced instead, since fragments repeat them. The rule doesn't
+/// depend on field names, so fields the app doesn't know are reassembled too.
+pub fn accumulate(acc: &mut Map<String, Value>, delta: Map<String, Value>) {
+    for (key, value) in delta {
+        let slot = acc.entry(key.as_str()).or_insert(Value::Null);
+        // Even the first indexed list is merged: one chunk can hold several
+        // fragments of the same entry.
+        if slot.is_null()
+            && let Value::Array(entries) = &value
+            && has_indexed_entries(entries)
+        {
+            *slot = Value::Array(Vec::new());
+        }
+        if slot.is_null() || key == "index" || key == "type" {
+            *slot = value;
+            continue;
+        }
+        match (slot, value) {
+            (Value::String(acc), Value::String(delta)) => acc.push_str(&delta),
+            (Value::Number(acc), Value::Number(delta)) => *acc = add(acc, &delta),
+            (Value::Object(acc), Value::Object(delta)) => accumulate(acc, delta),
+            (Value::Array(acc), Value::Array(delta)) => accumulate_entries(acc, delta),
+            // Mismatched types, such as a later `null`: keep what was assembled.
+            _ => {}
+        }
+    }
+}
+
+/// Lists of plain values only gain entries. Otherwise each fragment merges into the
+/// entry with the same `index`. Unlike the SDK, entries are matched by their `index`
+/// value rather than list position (so out-of-order indices can't merge into the
+/// wrong entry), and a fragment without one is appended instead of failing the reply.
+fn accumulate_entries(acc: &mut Vec<Value>, delta: Vec<Value>) {
+    let plain = acc.iter().all(|v| v.is_string() || v.is_number());
+    if plain && (!acc.is_empty() || !has_indexed_entries(&delta)) {
+        acc.extend(delta);
+        return;
+    }
+    for fragment in delta {
+        let target = fragment
+            .get("index")
+            .filter(|index| index.is_u64())
+            .and_then(|index| {
+                acc.iter()
+                    .position(|entry| entry.get("index") == Some(index))
+            });
+        match (target, fragment) {
+            (Some(position), Value::Object(fragment)) => {
+                if let Value::Object(entry) = &mut acc[position] {
+                    accumulate(entry, fragment);
+                }
+            }
+            (_, fragment) => acc.push(fragment),
+        }
+    }
+}
+
+fn has_indexed_entries(entries: &[Value]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.get("index").is_some_and(Value::is_u64))
+}
+
+fn add(acc: &Number, delta: &Number) -> Number {
+    match (acc.as_i64(), delta.as_i64()) {
+        (Some(acc), Some(delta)) => acc.saturating_add(delta).into(),
+        _ => Number::from_f64(acc.as_f64().unwrap_or(0.0) + delta.as_f64().unwrap_or(0.0))
+            .unwrap_or_else(|| acc.clone()),
     }
 }
 
