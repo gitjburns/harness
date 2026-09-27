@@ -26,6 +26,7 @@ use crate::config::{self, ApprovalMode, Settings};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
+use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
 use crate::tui::{self, Tui};
 
@@ -184,6 +185,7 @@ impl App {
                 &self.session.messages,
                 &self.notes,
                 self.turn.as_ref(),
+                self.settings.tool_reasoning,
             );
             tui.draw(&blocks, &mut self.view, &self.textarea, status)?;
             // Biased toward input so keys (Esc above all) are handled before more
@@ -244,7 +246,7 @@ impl App {
             &self.http,
             &self.settings.endpoint,
             self.settings.chat_prompt.as_deref(),
-            &self.session.messages,
+            tool_reasoning::request_messages(&self.session.messages, self.settings.tool_reasoning),
         );
         if let Some(turn) = self.turn.as_mut() {
             turn.phase = Phase::Streaming(Reply {
@@ -367,6 +369,9 @@ impl App {
         let call = PendingCall { call, code };
         let phase = match self.settings.approval_mode {
             _ if is_exempt(&call.code) => Phase::Ready(call),
+            // A no-op the model is meant to call freely. Kept out of `is_exempt`, which
+            // also selects the calls the per-turn cleanup removes.
+            _ if tool_reasoning::is_reasoning_call(&call.code) => Phase::Ready(call),
             ApprovalMode::Allow => Phase::Ready(call),
             ApprovalMode::Ask => Phase::Approving {
                 call,
@@ -667,6 +672,17 @@ impl App {
         }
     }
 
+    /// `/tool-reasoning`: switch tool reasoning and persist it. The transcript
+    /// changes at once and the next request is built accordingly, since both are
+    /// derived from the session.
+    fn toggle_tool_reasoning(&mut self) {
+        let enabled = !self.settings.tool_reasoning;
+        self.settings.tool_reasoning = enabled;
+        if let Err(error) = config::save_tool_reasoning(enabled) {
+            self.notice = Some(format!("couldn't save tool_reasoning: {error:#}"));
+        }
+    }
+
     /// Commands run in any state and keep an unknown command in the input for
     /// correction. A message is sent only when no turn is in progress; otherwise the
     /// draft is kept.
@@ -674,6 +690,10 @@ impl App {
         if text.starts_with('/') {
             match text.trim_end() {
                 "/exit" | "/quit" => return Ok(Flow::Exit),
+                "/tool-reasoning" => {
+                    self.textarea.clear();
+                    self.toggle_tool_reasoning();
+                }
                 command => self.notice = Some(format!("unknown command: {command}")),
             }
             return Ok(Flow::Continue);
@@ -727,6 +747,9 @@ impl App {
             info.push_str(&format!(" | {} tokens", thousands(tokens)));
         }
         info.push_str(&format!(" | {}", self.settings.approval_mode.as_str()));
+        if self.settings.tool_reasoning {
+            info.push_str(" | tool reasoning");
+        }
         let mut spans = vec![Span::styled(info, tui::dim())];
         let activity = match self.turn.as_ref().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
@@ -767,8 +790,10 @@ fn build_blocks<'a>(
     messages: &'a [Message],
     notes: &'a [Note],
     turn: Option<&'a Turn>,
+    tool_reasoning_enabled: bool,
 ) -> Vec<Block<'a>> {
     let blank = |key| Block::new(key, "", plain());
+    let turn_start = tool_reasoning::turn_start(messages);
     let mut blocks = Vec::new();
     if let Some(system) = system {
         blocks.push(Block::new(Key::System(0), "system", tui::dim()));
@@ -815,9 +840,23 @@ fn build_blocks<'a>(
                 blocks.push(blank(part(1)));
             }
             Role::Assistant => {
+                // Converted reasoning is drawn as the synthetic call it's sent as, ahead
+                // of the message. Drawn inline rather than as extra messages, so message
+                // indices (keys, note anchors) match the session.
+                let converted = tool_reasoning_enabled
+                    .then(|| tool_reasoning::converted(messages, i, turn_start))
+                    .flatten();
+                if let Some(text) = &converted {
+                    let part = |n| Key::Call(tool_reasoning::call_id(i), n);
+                    blocks.push(Block::new(part(0), "REPL", tui::dim()));
+                    blocks.push(Block::new(part(1), tool_reasoning::code(text), plain()));
+                    let result = tool_reasoning::RESULT;
+                    blocks.push(Block::new(part(2), result, tool_output_style()));
+                    blocks.push(blank(part(3)));
+                }
                 // Only reasoning, content, and calls are drawn; other fields are sent
                 // back but have no display form.
-                let reasoning = message.reasoning();
+                let reasoning = message.reasoning().filter(|_| converted.is_none());
                 let has_reasoning = reasoning.is_some();
                 if let Some(reasoning) = reasoning {
                     blocks.push(Block::new(part(0), reasoning, reasoning_style()));

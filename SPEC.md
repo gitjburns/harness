@@ -15,6 +15,7 @@ All paths are relative to the working directory.
 
   [chat]                             # optional
   prompt = """..."""                 # chat system message; omitted = none
+  tool_reasoning = false             # see Tool reasoning; default false; rewritten by /tool-reasoning
 
   [classifier]
   prompt = """..."""                 # required: classifier system prompt
@@ -23,7 +24,7 @@ All paths are relative to the working directory.
   approval_mode = "auto"             # "allow" | "ask" | "auto"; default "auto"; rewritten by Shift+Tab
   output_limit = 100000              # bytes of output per call sent to the model; default 100000
   ```
-  Unknown keys are rejected. A missing or invalid config, or an `api_key_env` naming an unset variable, is an error before the TUI starts. Shift+Tab rewrites only `approval_mode` (creating `[repl]` if missing), preserving the rest of the file.
+  Unknown keys are rejected. A missing or invalid config, or an `api_key_env` naming an unset variable, is an error before the TUI starts. Shift+Tab rewrites only `approval_mode` (creating `[repl]` if missing), and `/tool-reasoning` only `tool_reasoning` (creating `[chat]` if missing), preserving the rest of the file.
 - `.env`: read if present, only to resolve `api_key_env`; shell variables take precedence. It is never added to the process environment, so the REPL doesn't inherit it. No permission checks; the app never edits `.gitignore`.
 - `sessions/YYYYMMDD-HHMMSS.json` (local time): `{ "messages": [...] }`. Created on first save. Every save writes a synced temp file and renames it over the session file.
 - `replib/*.py`: optional REPL function library (see REPL).
@@ -53,7 +54,7 @@ All paths are relative to the working directory.
   - description: "Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries."
 - A turn starts with a user message. Each response's tool calls are handled in order, their results are sent, and the next response is requested. The turn ends when a response has no tool calls, on Esc, or on a stream error.
 - **Situational awareness.** Each turn opens with synthetic calls. First, every earlier `REPL` call whose code is made only of `FYI()`/`help()` statements (synthetic or the model's own) is removed with its result; an assistant message left with no calls, content, or other field with a value is removed too, and the session is saved. Then, after the user message, the app saves an assistant message with two `REPL` calls, `{"code": "FYI()"}` and `{"code": "help()"}` (ids `fyi-<unix millis>-<counter>`), and runs them in the REPL like any other calls, before the first request. So the context always holds exactly one environment snapshot and one library listing: the current turn's. `FYI()` is the driver's only snapshot implementation; it prints the lines `FYI()`, `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens>` (omitted until a response reports usage), and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `FYI()` is not in the registry, so `help()` doesn't list it.
-- Synthetic calls run without approval in every mode. Every other call is approved per `approval_mode`.
+- Synthetic calls run without approval in every mode, and so does code that is exactly `reasoning(<one string literal>)` (optional `r`/`u` prefix, any quoting; not f-strings, bytes, concatenation, keyword arguments, or other code alongside), since `reasoning()` is a no-op the model is meant to call freely. Every other call is approved per `approval_mode`.
 - Approval, per `approval_mode` at the moment each call is handled:
   - `allow`: run.
   - `ask`: prompt `allow? (y/n)`.
@@ -63,6 +64,14 @@ All paths are relative to the working directory.
 - Result: stdout and stderr in written order, then the repr of a trailing expression if not `None`, then a traceback if the code raised; `(no output)` if empty. Truncated at `output_limit` bytes on a character boundary, followed by `[output truncated: N more bytes]`.
 - Esc (or exit) while code runs kills the REPL's process group; the result is the output so far plus `[stopped by user]`. Every complete call that never ran gets `[not run: turn stopped]`.
 - SIGHUP, SIGTERM, and SIGINT stop the turn the same way (recording only, no transcript output) and exit.
+
+## Tool reasoning
+
+Experimental. With `[chat] tool_reasoning` on, each request and the transcript show the model its reasoning from earlier turns as tool calls instead of native reasoning. The session file is unchanged, so the setting can be switched either way at any time, including for resumed sessions. Deferred extension to the turn in progress: `SPEC-final-turn-tool-reasoning.md`.
+
+- Converted: each assistant message before the last user message whose reasoning text (as displayed; see Terminal UI) is non-empty. Messages with only encrypted `reasoning_details` are left as-is. The turn in progress keeps its native reasoning.
+- A converted message is sent as three messages: `{"role": "assistant", "content": "", "tool_calls": [REPL call, id reasoning-<message index>, code reasoning(<text as a JSON string literal>)]}`, `{"role": "tool", "tool_call_id": "reasoning-<message index>", "content": "(no output)"}`, then the message without `reasoning`, `reasoning_content`, and `reasoning_details`. Ids are stable across requests.
+- The synthetic calls never run. Their `(no output)` result relies on `replib/reasoning.py` defining `reasoning(text)` as a no-op that prints nothing and returns `None`; `help()` lists it, and the model is meant to call it.
 
 ## REPL
 
@@ -75,7 +84,7 @@ All paths are relative to the working directory.
 ## Terminal UI
 
 - Full screen on the alternate screen, with mouse capture. On exit the terminal returns to its previous contents; nothing is left behind.
-- The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are. Fields other than content, reasoning, and tool calls are sent but not shown.
+- The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are. Fields other than content, reasoning, and tool calls are sent but not shown. With tool reasoning on, converted messages are drawn as sent: the synthetic call and its result, then the message without its reasoning.
   - System message (if configured): `system` (dim), then the prompt.
   - User message: `> text`, cyan.
   - Assistant: reasoning dim, a blank line, then content in the default style. Reasoning is the first non-empty of `reasoning`, `reasoning_content`, and the `text` or `summary` of each `reasoning_details` entry (joined by blank lines).
@@ -87,7 +96,7 @@ All paths are relative to the working directory.
 - Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
 - Each frame is one synchronized update.
 - Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line. A click there only clears the selection.
-- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage; omitted until one has), then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
+- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage; omitted until one has), ` | tool reasoning` while it's on, then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
 ## Keys
@@ -111,6 +120,7 @@ All paths are relative to the working directory.
 
 - Input starting with `/` is a command. A leading space sends a literal `/`.
 - `/exit`, `/quit`: exit.
+- `/tool-reasoning`: switch tool reasoning on or off and save it to `config.toml`. The transcript and the next request change at once.
 - Unknown command: notice `unknown command: <input>`; the input is kept.
 - During a turn, the input stays editable and commands run. Enter on a message shows the notice `turn in progress (esc to stop)` and keeps the draft.
 
@@ -126,5 +136,7 @@ All paths are relative to the working directory.
 | `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, classifier request |
 | `src/repl.rs` | REPL process lifecycle and protocol |
 | `src/repl_driver.py` | Embedded Python driver |
-| `src/config.rs` | `config.toml` (including `approval_mode` persistence) and `.env` |
+| `src/config.rs` | `config.toml` (including `approval_mode` and `tool_reasoning` persistence) and `.env` |
 | `src/session.rs` | Message types and session file I/O |
+| `src/tool_reasoning.rs` | Tool reasoning conversion and the `reasoning()` approval exemption |
+| `replib/reasoning.py` | `reasoning()` library function |

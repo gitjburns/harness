@@ -20,6 +20,7 @@ Working log. Behavior contract: `SPEC.md`.
 14. **Chat system message.** Optional `[chat] prompt`, prepended to each chat request at send time and never saved, so the current config applies to resumed sessions.
 15. **App-managed scrollback.** Alternate screen with mouse capture; the transcript is drawn each frame from the system message, messages, the turn in progress, and display-only notes, so it always matches the model's context. App word wrap, scrolling (follow at bottom, PageUp/PageDown, wheel), drag selection with OSC 52 copy on release.
 16. **Endpoint-neutral replies.** Each streamed `delta` is merged whole by the OpenAI SDK's `accumulate_delta` rule, and every field is saved and sent back unchanged, so any endpoint's reasoning format (`reasoning`, `reasoning_content`, `reasoning_details`) round-trips. Only display picks known reasoning fields.
+17. **Tool reasoning (experimental).** `[chat] tool_reasoning` / `/tool-reasoning`: earlier turns' reasoning is sent and drawn as synthetic `reasoning("…")` calls with `(no output)` results, built per request from the unchanged session. First library function, `replib/reasoning.py`: a no-op the model is meant to call, listed by `help()`, exempt from approval when called on a plain string literal.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
@@ -33,6 +34,7 @@ Decided against:
 3. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
 4. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
 5. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
+6. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
 
 ## Open
 

@@ -38,6 +38,10 @@ struct Chat {
     /// System message sent ahead of the conversation in every chat request, never
     /// saved to the session. Omitted means no system message.
     prompt: Option<String>,
+    /// Send earlier turns' reasoning as `reasoning()` REPL calls (`tool_reasoning`).
+    /// Rewritten by `/tool-reasoning`.
+    #[serde(default)]
+    tool_reasoning: bool,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +104,7 @@ pub struct ResolvedEndpoint {
 pub struct Settings {
     pub endpoint: ResolvedEndpoint,
     pub chat_prompt: Option<String>,
+    pub tool_reasoning: bool,
     pub classifier_prompt: String,
     pub approval_mode: ApprovalMode,
     pub output_limit: usize,
@@ -145,38 +150,49 @@ pub fn load() -> anyhow::Result<Settings> {
             api_key,
         },
         chat_prompt: config.chat.prompt,
+        tool_reasoning: config.chat.tool_reasoning,
         classifier_prompt: config.classifier.prompt,
         approval_mode: config.repl.approval_mode,
         output_limit: config.repl.output_limit.unwrap_or(DEFAULT_OUTPUT_LIMIT),
     })
 }
 
-/// Persist `approval_mode`, changing only that value (and creating `[repl]` if
-/// missing) so comments and formatting elsewhere in the file are preserved.
+/// Persist `approval_mode` (Shift+Tab).
 pub fn save_approval_mode(mode: ApprovalMode) -> anyhow::Result<()> {
+    save_setting("repl", "approval_mode", mode.as_str().into())
+}
+
+/// Persist `tool_reasoning` (`/tool-reasoning`).
+pub fn save_tool_reasoning(enabled: bool) -> anyhow::Result<()> {
+    save_setting("chat", "tool_reasoning", enabled.into())
+}
+
+/// Change only `[table] key` (creating the table if missing) so comments and
+/// formatting elsewhere in the file are preserved.
+fn save_setting(table: &str, key: &str, new: toml_edit::Value) -> anyhow::Result<()> {
     let text =
         std::fs::read_to_string(CONFIG_PATH).with_context(|| format!("reading {CONFIG_PATH}"))?;
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {CONFIG_PATH}"))?;
     // Table-like covers both `[repl]` and `repl = { ... }`.
-    let repl = doc
-        .entry("repl")
+    let settings = doc
+        .entry(table)
         .or_insert_with(toml_edit::table)
         .as_table_like_mut()
-        .with_context(|| format!("{CONFIG_PATH}: `repl` is not a table"))?;
-    match repl
-        .get_mut("approval_mode")
+        .with_context(|| format!("{CONFIG_PATH}: `{table}` is not a table"))?;
+    match settings
+        .get_mut(key)
         .and_then(toml_edit::Item::as_value_mut)
     {
         // Replace the value in place, keeping its decor (e.g. a trailing comment).
         Some(value) => {
             let decor = value.decor().clone();
-            *value = mode.as_str().into();
+            *value = new;
             *value.decor_mut() = decor;
         }
         None => {
-            repl.insert("approval_mode", toml_edit::value(mode.as_str()));
+            settings.insert(key, toml_edit::Item::Value(new));
         }
     }
 

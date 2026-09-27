@@ -22,6 +22,7 @@ api_key_env = "OPENAI_API_KEY"   # optional; omit for servers that need no key
 prompt = """
 ...system message sent at the start of every request...
 """
+tool_reasoning = false           # see Tool reasoning; /tool-reasoning switches it
 
 [classifier]
 prompt = """
@@ -77,6 +78,8 @@ Shift+Tab cycles the mode; the choice is saved to `config.toml`.
 | `auto` | A separate request to the model judges the code against `[classifier] prompt`. Safe code runs, unsafe code is blocked, and anything else asks you. |
 | `allow` | Every call runs without asking. |
 
+A call that is only `reasoning("...")` on a plain string never needs approval, in any mode (see Library functions).
+
 ### Keys
 
 | Key | Action |
@@ -101,6 +104,7 @@ When you scroll up, the view stays put while the model writes; scroll back to th
 | Command | Action |
 |---|---|
 | `/exit`, `/quit` | Exit |
+| `/tool-reasoning` | Turn tool reasoning on or off (saved to `config.toml`) |
 
 To send a message that starts with `/`, begin it with a space.
 
@@ -108,7 +112,11 @@ To send a message that starts with `/`, begin it with a space.
 
 REPL state (variables, imports) lasts for one turn: from your message until the model's final answer. Each turn starts fresh. Calling `help()` in the REPL lists the output limit and any library functions.
 
-Library functions live in `replib/`, one or more Python files in the directory you run from. Mark a function with `@register` (no import needed) to make it available to the model and listed by `help()`:
+### Library functions
+
+Library functions are Python functions you provide for the model. They live in `replib/`, one or more `.py` files in the directory you run from, loaded in name order at the start of every turn. The model learns about them only from `help()`, which lists each one's signature and docstring.
+
+**Adding one.** Put it in any file in `replib/` and mark it with `@register` (no import needed):
 
 ```python
 @register
@@ -117,6 +125,23 @@ def word_count(path):
     with open(path) as f:
         return len(f.read().split())
 ```
+
+**Editing a description.** The docstring is exactly what the model reads, so it is the place to say what a function is for and when to use it. Edit it in place; the change takes effect from the next turn, since each turn starts a fresh REPL.
+
+**Removing one.** Delete the function, or the whole file. Code in `replib/` without `@register` still runs at load, but isn't listed or offered to the model.
+
+**Mistakes.** If a file fails to load, its error appears in the output of the turn's first call (the app's own `FYI()`), so you and the model both see it; the other files still load.
+
+This repo ships one library function, `replib/reasoning.py`:
+
+- `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval.
+- Tool reasoning (below) depends on it staying a no-op that prints nothing. Edit its docstring freely, but not its behavior.
+
+## Tool reasoning
+
+Experimental. When on, the model sees its reasoning from earlier turns as `reasoning("...")` REPL calls, each followed by its `(no output)` result, instead of as native reasoning. The current turn keeps its native reasoning. Turn it on or off with `/tool-reasoning`; the status line shows `| tool reasoning` while it's on.
+
+Only what's sent and shown changes: the session file keeps replies as the endpoint sent them, so switching it off restores the original view at once, including for resumed conversations. It requires `reasoning()` in `replib/` (above).
 
 ## Conversation files
 

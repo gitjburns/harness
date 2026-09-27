@@ -9,7 +9,6 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::config::ResolvedEndpoint;
-use crate::session::Message;
 
 /// The only tool the model has. Sent with every chat request.
 fn repl_tool() -> Value {
@@ -52,14 +51,14 @@ pub fn start(
     http: &reqwest::Client,
     endpoint: &ResolvedEndpoint,
     system_prompt: Option<&str>,
-    messages: &[Message],
+    messages: Vec<Value>,
 ) -> (JoinHandle<()>, UnboundedReceiver<StreamEvent>) {
     // The system message comes from config at send time, like `tools`; it is never
     // part of the session, so the current config applies to resumed sessions too.
     let messages: Vec<Value> = system_prompt
         .map(|prompt| json!({ "role": "system", "content": prompt }))
         .into_iter()
-        .chain(messages.iter().map(|message| json!(message)))
+        .chain(messages)
         .collect();
     let body = json!({
         "model": endpoint.model,
