@@ -3,3 +3,5 @@ sessions
 target
 src/__pycache__/
 ONBOARD.md
+monty
+config.toml
