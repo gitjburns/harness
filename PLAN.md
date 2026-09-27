@@ -21,6 +21,7 @@ Working log. Behavior contract: `SPEC.md`.
 15. **App-managed scrollback.** Alternate screen with mouse capture; the transcript is drawn each frame from the system message, messages, the turn in progress, and display-only notes, so it always matches the model's context. App word wrap, scrolling (follow at bottom, PageUp/PageDown, wheel), drag selection with OSC 52 copy on release.
 16. **Endpoint-neutral replies.** Each streamed `delta` is merged whole by the OpenAI SDK's `accumulate_delta` rule, and every field is saved and sent back unchanged, so any endpoint's reasoning format (`reasoning`, `reasoning_content`, `reasoning_details`) round-trips. Only display picks known reasoning fields.
 17. **Tool reasoning (experimental).** `[chat] tool_reasoning` / `/tool-reasoning`: earlier turns' reasoning is sent and drawn as synthetic `reasoning("…")` calls with `(no output)` results, built per request from the unchanged session. First library function, `replib/reasoning.py`: a no-op the model is meant to call, listed by `help()`, exempt from approval when called on a plain string literal.
+18. **Command completion.** Typing `/` lists matching commands (name, description) below the input in place of the status line; Up/Down, Tab, Enter, Esc. One command table (`src/commands.rs`) drives both completion and running.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).

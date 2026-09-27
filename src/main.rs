@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod commands;
 mod config;
 mod input;
 mod repl;

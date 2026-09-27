@@ -95,7 +95,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 - Scrolling: while at the bottom the view follows new output; scrolled up, it stays on the same text as output arrives or the width changes, until scrolled back to the bottom. Sending a message returns to the bottom.
 - Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
 - Each frame is one synchronized update.
-- Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line. A click there only clears the selection.
+- Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line, or the command completion list in its place (see Commands); the region grows to fit the list. A click there only clears the selection.
 - Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage; omitted until one has), ` | tool reasoning` while it's on, then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
@@ -103,12 +103,13 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 | Key | Action |
 |---|---|
-| Enter | Send (ignored when blank) |
+| Enter | Send (ignored when blank); with the completion list open, run the highlighted command |
 | ^J | Insert newline |
 | ^K | Delete to end of line; at end of line, join the next line |
 | ^U | Delete to start of line; at start of line, join the previous line |
-| Esc | Stop the turn |
+| Esc | Stop the turn; with the completion list open, only close it |
 | Shift+Tab | Cycle approval mode: ask → auto → allow |
+| Up / Down, Tab | With the completion list open: move the highlight (wrapping), complete to the highlighted command |
 | y / n | Answer an approval prompt (while it shows, only y, n, Esc, Shift+Tab, PageUp/PageDown, and the mouse act) |
 | PageUp / PageDown | Scroll the transcript a screen, less two rows |
 | Mouse wheel | Scroll the transcript one row |
@@ -119,6 +120,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 ## Commands
 
 - Input starting with `/` is a command. A leading space sends a literal `/`.
+- Completion list: shown below the input in place of the status line while the input is one line starting with `/` without whitespace, some command's name or alias starts with it, and no approval prompt is showing. One row per matching command (by name if it matches, else by its first matching alias) with its description; the first is highlighted, and any edit highlights the first again. At most 8 rows, scrolling with the highlight. Esc closes it until the input changes. Commands are defined once, in `src/commands.rs`, for both running and completion; the list order puts `/exit` last.
 - `/exit`, `/quit`: exit.
 - `/tool-reasoning`: switch tool reasoning on or off and save it to `config.toml`. The transcript and the next request change at once.
 - Unknown command: notice `unknown command: <input>`; the input is kept.
@@ -133,6 +135,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 | `src/tui.rs` | Alternate screen, mouse capture, screen layout, synchronized updates, clipboard |
 | `src/transcript.rs` | Transcript view: word wrap, scrolling, selection |
 | `src/input.rs` | Textarea setup, key map, paste |
+| `src/commands.rs` | Command table: names, aliases, descriptions, actions |
 | `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, classifier request |
 | `src/repl.rs` | REPL process lifecycle and protocol |
 | `src/repl_driver.py` | Embedded Python driver |

@@ -6,6 +6,7 @@ model = "Qwen3.8-27B"
 
 [chat]
 prompt = """FYI() and help() are synthetic tool calls injected into your context for your benefit. FYI() provides situational awareness - The date and time, your prompt tokens, and your which model you're running. help() lists any custom Python functions that are available."""
+tool_reasoning = true
 
 [classifier]
 prompt = """

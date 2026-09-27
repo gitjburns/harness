@@ -22,6 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 use crate::client::{self, StreamEvent, Verdict, VerdictKind};
+use crate::commands::{self, Action, Completion};
 use crate::config::{self, ApprovalMode, Settings};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent};
@@ -31,6 +32,9 @@ use crate::transcript::{Block, Key, View};
 use crate::tui::{self, Tui};
 
 const STOPPED: &str = "[stopped by user]";
+
+/// Most rows the command completion list shows at once.
+const COMPLETION_ROWS: usize = 8;
 
 pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     let repo_root = std::env::current_dir()?.display().to_string();
@@ -48,6 +52,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         context_tokens: None,
         prompt_tokens: None,
         signaled: false,
+        completion: 0,
+        completion_dismissed: None,
     };
     let result = app.run(&mut tui).await;
     let exited = tui.exit();
@@ -81,6 +87,12 @@ struct App {
     /// Exiting because of a signal: the terminal may be gone, so a failure to
     /// restore it is ignored.
     signaled: bool,
+    /// Highlighted row of the command completion list. Back to the first match
+    /// whenever the input changes.
+    completion: usize,
+    /// Input text for which Esc closed the completion list; it stays closed until
+    /// the input changes.
+    completion_dismissed: Option<String>,
 }
 
 struct Turn {
@@ -179,7 +191,7 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            let status = self.status_line();
+            let footer = self.footer();
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
                 &self.session.messages,
@@ -187,7 +199,7 @@ impl App {
                 self.turn.as_ref(),
                 self.settings.tool_reasoning,
             );
-            tui.draw(&blocks, &mut self.view, &self.textarea, status)?;
+            tui.draw(&blocks, &mut self.view, &self.textarea, &footer)?;
             // Biased toward input so keys (Esc above all) are handled before more
             // output from a fast stream.
             let step = tokio::select! {
@@ -634,7 +646,42 @@ impl App {
                     }
                     return Ok(Flow::Continue);
                 }
-                match input::handle_key(&mut self.textarea, key) {
+                // While the completion list shows, it takes the keys that act on it.
+                let completions = self.completions();
+                if !completions.is_empty() && key.modifiers.is_empty() {
+                    let count = completions.len();
+                    let selected = self.completion.min(count - 1);
+                    match key.code {
+                        KeyCode::Up => {
+                            self.completion = (selected + count - 1) % count;
+                            return Ok(Flow::Continue);
+                        }
+                        KeyCode::Down => {
+                            self.completion = (selected + 1) % count;
+                            return Ok(Flow::Continue);
+                        }
+                        KeyCode::Tab => {
+                            self.textarea.clear();
+                            self.textarea.insert_str(completions[selected].spelling);
+                            self.input_changed();
+                            return Ok(Flow::Continue);
+                        }
+                        KeyCode::Enter => {
+                            return self.run_command(completions[selected].command.action);
+                        }
+                        KeyCode::Esc => {
+                            self.completion_dismissed = Some(self.textarea.lines().join("\n"));
+                            return Ok(Flow::Continue);
+                        }
+                        _ => {}
+                    }
+                }
+                let before = self.textarea.lines().to_vec();
+                let action = input::handle_key(&mut self.textarea, key);
+                if self.textarea.lines() != before.as_slice() {
+                    self.input_changed();
+                }
+                match action {
                     InputAction::Submit(text) => return self.submit(text),
                     InputAction::Stop => self.stop_turn(None)?,
                     InputAction::CycleMode => self.cycle_mode(),
@@ -655,7 +702,10 @@ impl App {
                 }
                 _ => {}
             },
-            Event::Paste(text) => input::paste(&mut self.textarea, &text),
+            Event::Paste(text) => {
+                input::paste(&mut self.textarea, &text);
+                self.input_changed();
+            }
             // A resize needs nothing here: the next frame lays out at the new size.
             _ => {}
         }
@@ -683,20 +733,100 @@ impl App {
         }
     }
 
+    /// Run a command (typed in full, or picked from the completion list). The input
+    /// is cleared.
+    fn run_command(&mut self, action: Action) -> anyhow::Result<Flow> {
+        self.textarea.clear();
+        self.input_changed();
+        match action {
+            Action::Exit => return Ok(Flow::Exit),
+            Action::ToggleToolReasoning => self.toggle_tool_reasoning(),
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Completions for the input, or none when the list isn't showing: the input must
+    /// be one line starting with `/` and without whitespace, Esc must not have closed
+    /// the list for it, and no approval prompt may be showing (the list replaces the
+    /// status line, which carries the prompt).
+    fn completions(&self) -> Vec<Completion> {
+        let approving = matches!(
+            self.turn,
+            Some(Turn {
+                phase: Phase::Approving { .. },
+                ..
+            })
+        );
+        let [input] = self.textarea.lines() else {
+            return Vec::new();
+        };
+        if approving
+            || !input.starts_with('/')
+            || input.contains(char::is_whitespace)
+            || self.completion_dismissed.as_ref() == Some(input)
+        {
+            return Vec::new();
+        }
+        commands::completions(input)
+    }
+
+    /// The input text changed: highlight the first completion again and reopen a
+    /// list closed with Esc.
+    fn input_changed(&mut self) {
+        self.completion = 0;
+        self.completion_dismissed = None;
+    }
+
+    /// Rows below the input: the completion list while it shows, otherwise the
+    /// status line.
+    fn footer(&self) -> Vec<Line<'static>> {
+        let completions = self.completions();
+        if completions.is_empty() {
+            return vec![self.status_line()];
+        }
+        let selected = self.completion.min(completions.len() - 1);
+        // A window of rows that keeps the highlighted one in view.
+        let first = (selected + 1).saturating_sub(COMPLETION_ROWS);
+        let width = completions
+            .iter()
+            .map(|completion| completion.spelling.len())
+            .max()
+            .unwrap_or(0);
+        completions
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(COMPLETION_ROWS)
+            .map(|(index, completion)| {
+                // Indented to line up with the input text after the `> ` prompt.
+                let name = format!("  {:width$}   ", completion.spelling);
+                let description = completion.command.description;
+                if index == selected {
+                    let reversed = Style::default().reversed();
+                    Line::from(vec![
+                        Span::styled(name, reversed),
+                        Span::styled(description, reversed),
+                    ])
+                } else {
+                    Line::from(vec![Span::raw(name), Span::styled(description, tui::dim())])
+                }
+            })
+            .collect()
+    }
+
     /// Commands run in any state and keep an unknown command in the input for
     /// correction. A message is sent only when no turn is in progress; otherwise the
     /// draft is kept.
     fn submit(&mut self, text: String) -> anyhow::Result<Flow> {
         if text.starts_with('/') {
-            match text.trim_end() {
-                "/exit" | "/quit" => return Ok(Flow::Exit),
-                "/tool-reasoning" => {
-                    self.textarea.clear();
-                    self.toggle_tool_reasoning();
+            let command = text.trim_end();
+            return match commands::find(command) {
+                Some(action) => self.run_command(action),
+                None => {
+                    self.notice = Some(format!("unknown command: {command}"));
+                    Ok(Flow::Continue)
                 }
-                command => self.notice = Some(format!("unknown command: {command}")),
-            }
-            return Ok(Flow::Continue);
+            };
         }
         if self.turn.is_some() {
             self.notice = Some("turn in progress (esc to stop)".to_string());

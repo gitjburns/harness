@@ -1,6 +1,7 @@
 //! Terminal layer: a full-screen UI on the alternate screen. The app draws the whole
 //! screen each frame: the transcript view (`transcript::View`) above an input region
-//! of a top rule, the `> ` prompt and input box, and a status line.
+//! of a top rule, the `> ` prompt and input box, and footer rows (the status line, or
+//! the command completion list in its place).
 //!
 //! The mouse is captured, so the app handles wheel scrolling, selection, and copy
 //! (OSC 52). Leaving the alternate screen on exit restores the terminal as it was.
@@ -83,14 +84,14 @@ impl Tui {
         blocks: &[Block],
         view: &mut View,
         textarea: &TextArea,
-        status: Line,
+        footer: &[Line],
     ) -> io::Result<()> {
         queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
         let drawn = self
             .terminal
             .draw(|frame| {
                 let area = frame.area();
-                render(frame.buffer_mut(), area, blocks, view, textarea, status);
+                render(frame.buffer_mut(), area, blocks, view, textarea, footer);
             })
             .map(|_| ());
         let out = self.terminal.backend_mut();
@@ -125,7 +126,7 @@ fn render(
     blocks: &[Block],
     view: &mut View,
     textarea: &TextArea,
-    status: Line,
+    footer: &[Line],
 ) {
     let (width, height) = (area.width, area.height);
     if width == 0 || height == 0 {
@@ -136,8 +137,11 @@ fn render(
     let text_width = width.saturating_sub(text_x).max(1);
     let max_input_rows = (height / 2).saturating_sub(2).max(1);
     let input_rows = wrapped_rows(textarea, text_width).clamp(1, max_input_rows);
-    // Top rule + input rows + status line, never taller than the screen.
-    let region_height = (input_rows + 2).min(height);
+    // At least one footer row (the status line); more push the region up, leaving
+    // room for the top rule and one input row.
+    let footer_rows = (footer.len() as u16).clamp(1, height.saturating_sub(2).max(1));
+    // Top rule + input rows + footer rows, never taller than the screen.
+    let region_height = (input_rows + 1 + footer_rows).min(height);
     let region_top = height - region_height;
 
     view.render(blocks, Rect::new(0, 0, width, region_top), buf);
@@ -146,7 +150,7 @@ fn render(
         .borders(Borders::TOP)
         .border_style(dim())
         .render(Rect::new(0, region_top, width, 1), buf);
-    let text_rows = region_height.saturating_sub(2);
+    let text_rows = region_height.saturating_sub(1 + footer_rows);
     if text_rows > 0 {
         // ratatui's `White` is bright white (SGR 97); `Gray` is the normal one.
         buf.set_string(0, region_top + 1, PROMPT, Style::default().white());
@@ -155,7 +159,11 @@ fn render(
             buf,
         );
     }
-    buf.set_line(0, height - 1, &status, width);
+    // Footer rows fill the bottom of the screen.
+    let footer_top = height.saturating_sub(footer_rows);
+    for (row, line) in (footer_top..height).zip(footer) {
+        buf.set_line(0, row, line, width);
+    }
 }
 
 fn restore(out: &mut impl Write) -> io::Result<()> {

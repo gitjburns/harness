@@ -88,7 +88,7 @@ A call that is only `reasoning("...")` on a plain string never needs approval, i
 | Ctrl+J | New line |
 | Ctrl+K | Delete to end of line |
 | Ctrl+U | Delete to start of line |
-| Esc | Stop the model |
+| Esc | Stop the model (with the command list open, close the list) |
 | Shift+Tab | Change approval mode |
 | y / n | Allow or deny a REPL call when asked |
 | PageUp / PageDown | Scroll the conversation a screen |
@@ -105,6 +105,8 @@ When you scroll up, the view stays put while the model writes; scroll back to th
 |---|---|
 | `/exit`, `/quit` | Exit |
 | `/tool-reasoning` | Turn tool reasoning on or off (saved to `config.toml`) |
+
+Typing `/` opens a list of matching commands below the input: Up/Down to choose, Tab to complete, Enter to run, Esc to close.
 
 To send a message that starts with `/`, begin it with a space.
 
