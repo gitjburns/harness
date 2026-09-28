@@ -3,5 +3,7 @@ sessions
 target
 src/__pycache__/
 ONBOARD.md
+ONBOARD-inprog.md
+IN-PROG.md
 monty
 config.toml

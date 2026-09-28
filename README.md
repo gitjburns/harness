@@ -67,19 +67,21 @@ The status line under the prompt shows the model, the number of tokens in use (a
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
-**Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context. The app's own `FYI()` and `help()` calls never need approval, in any mode; when the model calls them itself, the call is approved like any other.
+**Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context.
+
+**Approval exemptions.** All synthetic tool calls, including `FYI()` and `help()` and any added in the future, never require approval, whether the app generates them or the model calls them explicitly. This applies in every approval mode and sandbox permission level. The exemption covers only those calls: unrelated code bundled with them, including code evaluated in arguments, remains subject to the normal approval rules.
 
 ### Approval modes
 
 Shift+Tab cycles the mode; the choice is saved to `config.toml`.
 
-| Mode | What happens to each REPL call |
+| Mode | What happens to each non-exempt REPL call |
 |---|---|
 | `ask` | You approve every call with `y` or deny it with `n`. |
 | `auto` | A separate request to the model judges the code against `[classifier] prompt`. Safe code runs, unsafe code is blocked, and anything else asks you. |
 | `allow` | Every call runs without asking. |
 
-A call that is only `reasoning("...")` on a plain string never needs approval, in any mode, and always succeeds (see Library functions).
+`reasoning()` is not a synthetic tool call; it has a separate approval exemption. A call that is only `reasoning("...")` on a plain string never needs approval, in any mode or permission level, and always succeeds (see Library functions). It cannot exempt unrelated code bundled with it.
 
 ### Keys
 

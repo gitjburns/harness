@@ -10,9 +10,9 @@ Removed: `[classifier]`, `[repl] approval_mode`. Added:
 
 ```toml
 [repl]
-permission = "none"          # "none" | "read-only" | "read-write"; default "none"; rewritten by Shift+Tab
-lib_auto_allow = false       # default false; rewritten by /lib-auto
-max_memory_mb = 2048         # REPL worker memory limit in MiB; default 2048
+permission = "none"          # "none" | "read-only" | "read-write"; rewritten by Shift+Tab
+lib_auto_allow = false       # rewritten by /lib-auto
+max_memory_mb = 2048         # REPL worker memory limit in MiB
 
 [commands]
 deny = ["git", "rm"]         # command names; always denied
@@ -22,7 +22,7 @@ env_filter = ["GITHUB_TOKEN"] # exact variable names removed from commands' envi
 cargo = "/Users/me/.cargo/bin/cargo"
 ```
 
-An `allow` value that isn't an absolute path is a config error. A name in both `deny` and `allow` is denied.
+`permission`, `lib_auto_allow`, and `max_memory_mb` are required; omission is a startup error. The values above are examples, not runtime defaults. An `allow` value that isn't an absolute path is a config error. A name in both `deny` and `allow` is denied.
 
 ## REPL
 
@@ -32,7 +32,8 @@ An `allow` value that isn't an absolute path is a config error. A name in both `
 - Limits: `max_suspensions = usize::MAX`; `max_memory` from `[repl] max_memory_mb`; no time limits (Esc stops). Hitting the memory limit discards the worker and ends the call with `[REPL memory limit of <N> MiB exceeded. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]`.
 - The repo (working directory) is mounted read-write at its real absolute path, which is also the sandbox working directory. `os.getenv`/`os.environ` see an empty environment.
 - Result: `print` output in order, then the repr of a trailing expression if not `None`, then a traceback if the code raised; `(no output)` if empty; truncated at `output_limit` as before.
-- Exact `reasoning(<string literal>)` calls are still answered `(no output)` without running.
+- The approval exemption contract in `SPEC.md` is preserved: all synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval at any permission level, whether app-generated or explicitly called by the model. Unrelated code bundled with them, including code evaluated in arguments, remains subject to normal permission and approval rules.
+- `reasoning()` is not synthetic and remains separately approval-exempt at every permission level. Exact `reasoning(<string literal>)` calls are answered `(no output)` without running; unrelated code cannot inherit the exemption.
 
 ## Permissions
 
@@ -83,4 +84,4 @@ Every file operation reaches the app as an OS call and is checked before it is s
 
 ## Removed
 
-`src/repl_driver.py`, the classifier (request, verdict notes, `[classifier] prompt`), approval modes, and the `FYI()`/`help()` approval exemption.
+`src/repl_driver.py`, the classifier (request, verdict notes, `[classifier] prompt`), and approval modes. The synthetic-call and separate `reasoning()` approval exemptions remain.
