@@ -32,11 +32,11 @@ Decided against:
 ## Next
 
 1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
-2. **Sandbox.** OS-enforced containment of the REPL: Seatbelt (`sandbox-exec`) on macOS, Landlock (+ seccomp) or bubblewrap on Linux. Writes limited to the repo, no network; privileged operations via app-brokered functions that ask the user.
+2. **Sandbox.** Replace the CPython REPL with Monty; permission levels, brokered commands, agent-written library functions, failure log. Design: `SPEC-sandbox.md`.
 3. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
-4. **`replib/` functions.** File helpers (`read`/`write`/`edit`/`run`), subagents, knowledge-base search. Subagent-style functions need a driver → app callback in the protocol.
-5. **Audit hooks** (optional, inside the sandbox): prompt on ordinary Python calls instead of failing.
-6. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
+4. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
+5. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
+6. **Harness as teacher.** Turn the failure log (`SPEC-sandbox.md`) into proposed edits to the persistent guidance, for user approval.
 
 ## Open
 
