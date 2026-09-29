@@ -52,8 +52,8 @@ pub fn start(
     tool_description: &str,
     messages: Vec<Value>,
 ) -> (JoinHandle<()>, UnboundedReceiver<StreamEvent>) {
-    // The system message comes from config at send time, like `tools`; it is never
-    // part of the session, so the current config applies to resumed sessions too.
+    // The effective prompt (config or CLI override) is added at send time, never
+    // saved in the session, so this invocation's prompt applies on resume too.
     let messages: Vec<Value> = system_prompt
         .map(|prompt| json!({ "role": "system", "content": prompt }))
         .into_iter()

@@ -65,6 +65,14 @@ harness --resume 20260925-143012
 
 The earlier conversation is shown, and new messages are added to the same file.
 
+Override `[chat] prompt` for this invocation with literal text:
+
+```sh
+harness --system-prompt "Your system prompt"
+```
+
+This also works with `--resume <NAME>`. The text is used verbatim, including an empty string, without changing configuration or saving the prompt in the session. Omit the option to use the configured prompt.
+
 ## Using it
 
 Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: the model's reasoning appears dimmed, followed by the answer.
@@ -181,7 +189,7 @@ Only what's sent and shown changes: the session file keeps replies as the endpoi
 
 ## Conversation files
 
-Session files hold the conversation exactly as it is sent to the model, including tool calls and their results. The `[chat] prompt` system message isn't saved; each request uses the one currently in `config.toml`, including for resumed conversations:
+Session files hold the conversation exactly as it is sent to the model, including tool calls and their results. The system message isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [

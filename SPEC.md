@@ -31,7 +31,7 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
 
 ## Messages
 
-- `messages` is exactly the array sent to the endpoint, after the system message. The system message is `[chat] prompt` as currently configured, added at send time and never saved.
+- `messages` is exactly the array sent to the endpoint, after the system message. `--system-prompt <TEXT>` overrides `[chat] prompt` for this invocation, including resumed sessions. The argument is literal text used verbatim, including an empty string. Without it, the configured prompt is used. The effective prompt is displayed and added at send time, never saved to configuration or session files.
   - user: `{"role": "user", "content"}`
   - assistant: `{"role": "assistant", "content", "tool_calls"?, ...}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`. Every other field the endpoint streamed (reasoning under whatever name it uses, and unknown fields, here and inside tool calls) is kept and sent back unchanged.
   - tool: `{"role": "tool", "tool_call_id", "content"}`
@@ -43,7 +43,7 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
 
 ## Requests
 
-- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured. `messages` starts with `{"role": "system", "content": [chat] prompt}` when configured.
+- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured. When an effective system prompt is present, `messages` starts with `{"role": "system", "content": <effective prompt>}`.
 - SSE `data:` lines: each `delta` is merged into the reply by the OpenAI SDK's `accumulate_delta` rule, whatever its fields: strings appended, numbers added, objects merged recursively, lists of entries with an `index` merged by matching `index` value (a fragment without one is appended), other lists extended; `index` and `type` are replaced; a value of a different type (such as a later `null`) is ignored. `role` is always `assistant`; `index` is removed from saved tool calls. `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
 - Classifier: non-streaming request to the same endpoint and model. System message: `[classifier] prompt`. User message: `Repository root: <absolute working directory>` and the code in a fenced block. `response_format` is a strict JSON schema `{"effects": string, "verdict": "safe" | "unsafe" | "inconclusive"}`, both required, in that order.
 

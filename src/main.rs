@@ -36,6 +36,9 @@ struct Args {
     /// sessions and exit.
     #[arg(long, value_name = "NAME")]
     resume: Option<Option<String>>,
+    /// Override the configured system prompt with literal text for this invocation.
+    #[arg(long, value_name = "TEXT")]
+    system_prompt: Option<String>,
 }
 
 /// Dispatch workers before creating the application runtime or reading configuration.
@@ -60,7 +63,11 @@ async fn run_app(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
     // Config and session errors are reported before the terminal UI starts.
-    let settings = config::load(&dir)?;
+    let mut settings = config::load(&dir)?;
+    // Requests and transcript rendering share this invocation's effective prompt.
+    if let Some(prompt) = args.system_prompt {
+        settings.chat_prompt = Some(prompt);
+    }
     let session = match args.resume {
         Some(Some(name)) => {
             let (session, repaired) = Session::resume(&dir, &name)?;
