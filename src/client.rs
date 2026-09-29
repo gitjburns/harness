@@ -1,22 +1,20 @@
-//! Chat completions: the streaming chat request (over server-sent events) and the
-//! non-streaming classifier request.
+//! Streaming chat completions over server-sent events.
 
 use anyhow::{Context, bail};
 use futures::StreamExt;
-use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::config::ResolvedEndpoint;
 
-/// The only tool the model has. Sent with every chat request.
-fn repl_tool() -> Value {
+/// The only tool the model has. Each request uses the configured description verbatim.
+fn repl_tool(tool_description: &str) -> Value {
     json!({
         "type": "function",
         "function": {
             "name": "REPL",
-            "description": "Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries.",
+            "description": tool_description,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -51,6 +49,7 @@ pub fn start(
     http: &reqwest::Client,
     endpoint: &ResolvedEndpoint,
     system_prompt: Option<&str>,
+    tool_description: &str,
     messages: Vec<Value>,
 ) -> (JoinHandle<()>, UnboundedReceiver<StreamEvent>) {
     // The system message comes from config at send time, like `tools`; it is never
@@ -64,7 +63,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool()],
+        "tools": [repl_tool(tool_description)],
         "messages": messages,
     });
     let request = post(http, endpoint, &body);
@@ -229,71 +228,4 @@ fn post(
         Some(key) => request.bearer_auth(key),
         None => request,
     }
-}
-
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum VerdictKind {
-    Safe,
-    Unsafe,
-    Inconclusive,
-}
-
-#[derive(Deserialize)]
-pub struct Verdict {
-    pub effects: String,
-    pub verdict: VerdictKind,
-}
-
-/// Ask the classifier to judge `code`. It gets no conversation context: only the
-/// configured system prompt, the repository root, and the code.
-pub async fn classify(
-    http: reqwest::Client,
-    endpoint: &ResolvedEndpoint,
-    prompt: &str,
-    repo_root: &str,
-    code: &str,
-) -> anyhow::Result<Verdict> {
-    // `effects` precedes `verdict` so the model states what the code does before
-    // judging it; strict mode requires every property in `required`.
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "effects": {
-                "type": "string",
-                "description": "The code's effects relevant to the rules: files read, written, deleted, or renamed; commands run; network access."
-            },
-            "verdict": { "type": "string", "enum": ["safe", "unsafe", "inconclusive"] }
-        },
-        "required": ["effects", "verdict"],
-        "additionalProperties": false
-    });
-    let body = json!({
-        "model": endpoint.model,
-        "messages": [
-            { "role": "system", "content": prompt },
-            { "role": "user", "content": format!("Repository root: {repo_root}\n\nCode:\n```python\n{code}\n```") },
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": { "name": "verdict", "strict": true, "schema": schema }
-        },
-    });
-    let response = post(&http, endpoint, &body)
-        .send()
-        .await
-        .context("sending classifier request")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("HTTP {status}: {body}");
-    }
-    let reply: Value = response
-        .json()
-        .await
-        .context("reading classifier response")?;
-    let content = reply["choices"][0]["message"]["content"]
-        .as_str()
-        .context("classifier response has no content")?;
-    serde_json::from_str(content).with_context(|| format!("parsing classifier verdict: {content}"))
 }

@@ -2,28 +2,55 @@ mod app;
 mod client;
 mod commands;
 mod config;
+mod failures;
+mod host;
+mod hostfs;
 mod input;
 mod repl;
 mod session;
 mod tool_reasoning;
 mod transcript;
 mod tui;
+mod worker;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use std::process::ExitCode;
 
 use session::{NOT_RUN, Session};
 
+// Only worker protocol configuration sets a limit; the TUI remains unlimited.
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
+
+#[derive(Subcommand)]
+enum Mode {
+    #[command(hide = true)]
+    Subprocess,
+}
+
 #[derive(Parser)]
 struct Args {
+    #[command(subcommand)]
+    mode: Option<Mode>,
     /// Continue the named session, appending to it. Without a name, list the saved
     /// sessions and exit.
     #[arg(long, value_name = "NAME")]
     resume: Option<Option<String>>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Dispatch workers before creating the application runtime or reading configuration.
+fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
+    if matches!(args.mode, Some(Mode::Subprocess)) {
+        return Ok(worker::run());
+    }
+    run_app(args)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Load the user's session and start the interactive application.
+#[tokio::main]
+async fn run_app(args: Args) -> anyhow::Result<()> {
     let dir = config::harness_dir()?;
     // Listing needs no config, so it works even while the config is broken.
     if let Some(None) = args.resume {

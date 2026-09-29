@@ -1,7 +1,7 @@
 //! Chat loop: input events, the tool-calling turn, and session persistence.
 //!
 //! A turn starts with a user message and alternates between streaming a response and
-//! handling its tool calls (classify or ask, then run in the turn's REPL). It ends
+//! handling its tool calls in the turn's REPL, with prompts at host operations. It ends
 //! when a response has no tool calls, on Esc, or on a stream error.
 //!
 //! The screen is drawn from state every frame (`build_blocks`): the session's
@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
+use anyhow::Context;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -19,13 +20,15 @@ use ratatui_textarea::TextArea;
 use serde_json::{Map, Value};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::client::{self, StreamEvent, Verdict, VerdictKind};
+use crate::client::{self, StreamEvent};
 use crate::commands::{self, Action, Completion};
-use crate::config::{self, ApprovalMode, Settings};
+use crate::config::{self, Settings};
+use crate::failures::FailureLog;
 use crate::input::{self, InputAction};
-use crate::repl::{Repl, ReplEvent};
+use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
@@ -36,12 +39,15 @@ const STOPPED: &str = "[stopped by user]";
 /// Most rows the command completion list shows at once.
 const COMPLETION_ROWS: usize = 8;
 
+/// Validate persistent failure history and start workers before taking over the terminal.
 pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
-    let repo_root = std::env::current_dir()?.display().to_string();
+    let failures = FailureLog::load(&settings.dir)?;
+    let runtime = Runtime::new(&settings).await?;
     let mut tui = Tui::enter()?;
     let mut app = App {
         settings,
-        repo_root,
+        runtime,
+        failures,
         session,
         http: reqwest::Client::new(),
         textarea: input::new_textarea(),
@@ -56,6 +62,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         completion_dismissed: None,
     };
     let result = app.run(&mut tui).await;
+    app.runtime.close().await;
     let exited = tui.exit();
     // After a signal the terminal may be gone, so restoring it can fail harmlessly.
     if !app.signaled {
@@ -66,13 +73,13 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
 
 struct App {
     settings: Settings,
-    /// Absolute path of the working directory, given to the classifier.
-    repo_root: String,
+    runtime: Runtime,
+    failures: FailureLog,
     session: Session,
     http: reqwest::Client,
     textarea: TextArea<'static>,
     view: View,
-    /// Display-only lines (verdicts, errors), never saved.
+    /// Display-only lines (failure counts, errors), never saved in the session.
     notes: Vec<Note>,
     turn: Option<Turn>,
     /// UI-only message shown in the status line until the next key press.
@@ -99,7 +106,7 @@ struct Turn {
     phase: Phase,
     /// Tool calls from the last response not yet handled, in order.
     queue: VecDeque<ToolCall>,
-    /// Started by the turn's first call; dropping it kills the process.
+    /// Started by the turn's first call; dropping it aborts execution and its worker.
     repl: Option<Repl>,
 }
 
@@ -108,21 +115,20 @@ enum Phase {
     /// request once the queue is empty.
     Idle,
     Streaming(Reply),
-    Classifying {
-        call: PendingCall,
-        task: JoinHandle<anyhow::Result<Verdict>>,
-    },
-    /// Waiting for y/n. `effects` is the classifier's description, if it gave one.
-    Approving {
-        call: PendingCall,
-        effects: Option<String>,
-    },
-    /// Approved; `advance` runs it.
+    /// Arguments validated; `advance` runs it.
     Ready(PendingCall),
     Running {
         call: PendingCall,
         output: String,
+        prompt: Option<PendingPrompt>,
     },
+    /// Keep cleanup cancelable and the UI responsive while returning the worker.
+    Finishing(JoinHandle<anyhow::Result<()>>),
+}
+
+struct PendingPrompt {
+    operation: String,
+    answer: oneshot::Sender<bool>,
 }
 
 struct PendingCall {
@@ -148,7 +154,7 @@ struct Note {
 
 /// Where a note is shown. A note whose anchor is removed disappears with it.
 enum Anchor {
-    /// Under the call's code, above its result (classifier verdicts).
+    /// Under the call's code, above its result (failure occurrence notes).
     Call(String),
     /// After the first `n` messages (errors). Adjusted when earlier
     /// messages are removed.
@@ -163,7 +169,7 @@ enum Step {
 
 enum TurnEvent {
     Stream(StreamEvent),
-    Verdict(anyhow::Result<Verdict>),
+    Finished(anyhow::Result<()>),
     Repl(anyhow::Result<ReplEvent>),
 }
 
@@ -222,7 +228,10 @@ impl App {
                     }
                 }
                 Step::Turn(TurnEvent::Stream(event)) => self.on_stream(event)?,
-                Step::Turn(TurnEvent::Verdict(verdict)) => self.on_verdict(verdict)?,
+                Step::Turn(TurnEvent::Finished(result)) => {
+                    self.turn = None;
+                    result.context("ending REPL session")?;
+                }
                 Step::Turn(TurnEvent::Repl(event)) => self.on_repl(event)?,
             }
             self.advance().await?;
@@ -230,7 +239,7 @@ impl App {
     }
 
     /// Move the turn forward until it waits on something: the stream, the
-    /// classifier, the user, or the REPL.
+    /// user, the REPL, or worker cleanup.
     async fn advance(&mut self) -> anyhow::Result<()> {
         loop {
             let Some(turn) = self.turn.as_mut() else {
@@ -253,11 +262,13 @@ impl App {
         }
     }
 
+    /// Build each request from current settings and the authoritative session messages.
     fn start_request(&mut self) {
         let (task, events) = client::start(
             &self.http,
             &self.settings.endpoint,
             self.settings.chat_prompt.as_deref(),
+            &self.settings.repl_tool_description,
             tool_reasoning::request_messages(&self.session.messages, self.settings.tool_reasoning),
         );
         if let Some(turn) = self.turn.as_mut() {
@@ -310,7 +321,13 @@ impl App {
         // Queue the calls before anything can fail, so an error exit still records a
         // result for each of them.
         if calls.is_empty() {
-            self.turn = None;
+            // Keep ownership in turn state until reset finishes, so Esc and exit
+            // can abort the task and drop its REPL instead of detaching cleanup.
+            if let Some(repl) = self.turn.as_mut().and_then(|turn| turn.repl.take()) {
+                self.set_phase(Phase::Finishing(tokio::spawn(repl.finish())));
+            } else {
+                self.turn = None;
+            }
         } else if let Some(turn) = self.turn.as_mut() {
             turn.queue = calls.into();
         }
@@ -367,7 +384,7 @@ impl App {
         (calls, saved)
     }
 
-    /// Start the call's approval according to the current mode. Calls that can't run
+    /// Validate and queue a call. Calls that can't run
     /// get their result recorded here, leaving the turn `Idle`.
     ///
     /// Ordering rule (here and in every handler below): a call's result is recorded,
@@ -386,84 +403,20 @@ impl App {
         if tool_reasoning::is_reasoning_call(&code) {
             return self.record_result(&call, tool_reasoning::RESULT.to_string());
         }
-        let call = PendingCall { call, code };
-        let phase = match self.settings.approval_mode {
-            _ if is_exempt(&call.code) => Phase::Ready(call),
-            ApprovalMode::Allow => Phase::Ready(call),
-            ApprovalMode::Ask => Phase::Approving {
-                call,
-                effects: None,
-            },
-            ApprovalMode::Auto => {
-                let http = self.http.clone();
-                let endpoint = self.settings.endpoint.clone();
-                let prompt = self.settings.classifier_prompt.clone();
-                let repo_root = self.repo_root.clone();
-                let code = call.code.clone();
-                let task = tokio::spawn(async move {
-                    client::classify(http, &endpoint, &prompt, &repo_root, &code).await
-                });
-                Phase::Classifying { call, task }
-            }
-        };
-        self.set_phase(phase);
+        // Host operations enforce permissions individually. A synthetic call never
+        // grants approval to unrelated code bundled alongside it or in arguments.
+        self.set_phase(Phase::Ready(PendingCall { call, code }));
         Ok(())
     }
 
+    /// Replace only the active phase, preserving queued calls and REPL ownership.
     fn set_phase(&mut self, phase: Phase) {
         if let Some(turn) = self.turn.as_mut() {
             turn.phase = phase;
         }
     }
 
-    fn on_verdict(&mut self, verdict: anyhow::Result<Verdict>) -> anyhow::Result<()> {
-        let Some(turn) = self.turn.as_mut() else {
-            return Ok(());
-        };
-        let Phase::Classifying { call, .. } = std::mem::replace(&mut turn.phase, Phase::Idle)
-        else {
-            return Ok(());
-        };
-        let anchor = Anchor::Call(call.call.id.clone());
-        match verdict {
-            Ok(Verdict {
-                effects,
-                verdict: VerdictKind::Safe,
-            }) => {
-                self.set_phase(Phase::Ready(call));
-                self.note(anchor, format!("safe: {effects}"), Style::new().green());
-            }
-            Ok(Verdict {
-                effects,
-                verdict: VerdictKind::Unsafe,
-            }) => {
-                self.record_result(&call.call, format!("Blocked: {effects}"))?;
-                self.note(anchor, format!("unsafe: {effects}"), Style::new().red());
-            }
-            Ok(Verdict {
-                effects,
-                verdict: VerdictKind::Inconclusive,
-            }) => {
-                let line = format!("inconclusive: {effects}");
-                self.set_phase(Phase::Approving {
-                    call,
-                    effects: Some(effects),
-                });
-                self.note(anchor, line, Style::new().yellow());
-            }
-            // A classifier failure asks the user rather than blocking or running.
-            Err(error) => {
-                self.set_phase(Phase::Approving {
-                    call,
-                    effects: None,
-                });
-                let line = format!("classifier failed: {error:#}");
-                self.note(anchor, line, Style::new().yellow());
-            }
-        }
-        Ok(())
-    }
-
+    /// Attach a display-only note without changing the messages sent to the model.
     fn note(&mut self, anchor: Anchor, text: String, style: Style) {
         self.notes.push(Note {
             anchor,
@@ -472,63 +425,59 @@ impl App {
         });
     }
 
-    /// Answer the approval prompt.
+    /// Answer only the suspended host operation; the driver produces any denial result.
     fn approve(&mut self, allow: bool) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
-        let Phase::Approving { call, effects } = std::mem::replace(&mut turn.phase, Phase::Idle)
-        else {
+        let Phase::Running { prompt, .. } = &mut turn.phase else {
             return Ok(());
         };
-        if allow {
-            turn.phase = Phase::Ready(call);
-            return Ok(());
+        if let Some(prompt) = prompt.take() {
+            prompt.answer.send(allow).map_err(|_| {
+                anyhow::anyhow!("couldn't answer approval: the REPL stopped waiting")
+            })?;
         }
-        let result = match effects {
-            Some(effects) => format!("Denied by user: {effects}"),
-            None => "Denied by user.".to_string(),
-        };
-        self.record_result(&call.call, result)
+        Ok(())
     }
 
+    /// Lazily start the turn's driver and enqueue code without awaiting execution.
     async fn run_call(&mut self, call: PendingCall) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
         if turn.repl.is_none() {
-            match Repl::start(
-                self.settings.output_limit,
-                &self.settings.endpoint.model,
-                &self.settings.dir,
-            ) {
-                Ok(repl) => turn.repl = Some(repl),
-                Err(error) => {
-                    let result = format!("REPL failed to start: {error:#}");
-                    return self.record_result(&call.call, result);
-                }
-            }
+            turn.repl = Some(self.runtime.start());
         }
         let repl = turn.repl.as_mut().expect("started above");
-        // The driver reads requests on a dedicated thread from startup, so this write
-        // doesn't wait on library loading or on earlier code.
+        // Sending only queues a message; library loading and prompts happen on the
+        // driver task after this call is restored to turn state.
         if let Err(error) = repl.send(&call.code, self.prompt_tokens).await {
             // Dropping the REPL kills it; the next call starts a fresh one.
             turn.repl = None;
-            return self.record_result(&call.call, format!("{error:#}"));
+            return self.record_result(&call.call, format!(
+                "[REPL driver failed: {error:#}. This code was not run. REPL state was lost; the next call starts a fresh session and reloads the library.]"
+            ));
         }
         turn.phase = Phase::Running {
             call,
             output: String::new(),
+            prompt: None,
         };
         Ok(())
     }
 
+    /// Keep results, host prompts, and persistent failure facts attached to the active call.
     fn on_repl(&mut self, event: anyhow::Result<ReplEvent>) -> anyhow::Result<()> {
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
-        let Phase::Running { output, .. } = &mut turn.phase else {
+        let Phase::Running {
+            call,
+            output,
+            prompt,
+        } = &mut turn.phase
+        else {
             return Ok(());
         };
         let (value, error) = match event {
@@ -536,14 +485,50 @@ impl App {
                 output.push_str(&text);
                 return Ok(());
             }
+            Ok(ReplEvent::Prompt { operation, answer }) => {
+                anyhow::ensure!(prompt.is_none(), "REPL requested overlapping approvals");
+                *prompt = Some(PendingPrompt { operation, answer });
+                return Ok(());
+            }
+            Ok(ReplEvent::Failure {
+                kind,
+                message,
+                code,
+            }) => {
+                let anchor = Anchor::Call(call.call.id.clone());
+                let session = self
+                    .session
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .context("session path has no UTF-8 session name")?;
+                // Persist before displaying the count; a failed append must not
+                // claim a durable occurrence or lose ownership of the running call.
+                let count = self.failures.record(session, kind, &message, &code)?;
+                let first_line = message.lines().next().unwrap_or("");
+                self.note(
+                    anchor,
+                    format!("{kind}: {first_line} (seen {count} times)"),
+                    Style::new().yellow(),
+                );
+                return Ok(());
+            }
             Ok(ReplEvent::Done { value, error }) => (value, error),
-            // The process died: its state is gone, and the next call starts a new one.
+            // Worker failures are reported by the driver. Closure here means the
+            // driver itself failed, so discard it and make the state loss explicit.
             Err(error) => {
                 turn.repl = None;
-                (None, Some(format!("[REPL process exited: {error:#}]")))
+                (
+                    None,
+                    Some(format!(
+                        "[REPL driver failed: {error:#}. REPL state was lost; the next call starts a fresh session and reloads the library.]"
+                    )),
+                )
             }
         };
-        let Phase::Running { call, mut output } = std::mem::replace(&mut turn.phase, Phase::Idle)
+        let Phase::Running {
+            call, mut output, ..
+        } = std::mem::replace(&mut turn.phase, Phase::Idle)
         else {
             return Ok(());
         };
@@ -591,15 +576,21 @@ impl App {
                 check(saved);
                 not_run = calls;
             }
-            Phase::Classifying { call, task } => {
+            Phase::Finishing(task) => {
                 task.abort();
-                not_run.push(call.call);
             }
-            Phase::Approving { call, .. } | Phase::Ready(call) => not_run.push(call.call),
-            Phase::Running { call, mut output } => {
+            Phase::Ready(call) => not_run.push(call.call),
+            Phase::Running {
+                call,
+                mut output,
+                prompt,
+            } => {
                 if let Some(repl) = turn.repl.as_mut() {
                     repl.kill();
                 }
+                // Cancel execution before dropping the answer sender; otherwise
+                // sandbox code could catch a canceled prompt and run more code.
+                drop(prompt);
                 if !output.is_empty() && !output.ends_with('\n') {
                     output.push('\n');
                 }
@@ -623,6 +614,7 @@ impl App {
         }
     }
 
+    /// Route terminal events, restricting input while a host operation awaits approval.
     fn on_input(&mut self, tui: &mut Tui, event: Event) -> anyhow::Result<Flow> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -639,13 +631,7 @@ impl App {
                     return Ok(Flow::Continue);
                 }
                 // While a call awaits approval, only y/n, Esc, and Shift+Tab act.
-                if matches!(
-                    self.turn,
-                    Some(Turn {
-                        phase: Phase::Approving { .. },
-                        ..
-                    })
-                ) {
+                if self.pending_prompt().is_some() {
                     match key.code {
                         KeyCode::Char('y') => self.approve(true)?,
                         KeyCode::Char('n') => self.approve(false)?,
@@ -721,7 +707,7 @@ impl App {
                 }
                 _ => {}
             },
-            Event::Paste(text) => {
+            Event::Paste(text) if self.pending_prompt().is_none() => {
                 input::paste(&mut self.textarea, &text);
                 self.input_changed();
             }
@@ -731,13 +717,21 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    /// Shift+Tab: switch approval mode and persist it. Applies from the next call
-    /// that hasn't been classified yet.
+    /// Expose the single pending prompt to key routing, completion, and status rendering.
+    fn pending_prompt(&self) -> Option<&PendingPrompt> {
+        match &self.turn.as_ref()?.phase {
+            Phase::Running { prompt, .. } => prompt.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Shift+Tab: publish the new permission before persisting it; applies to the next operation.
     fn cycle_mode(&mut self) {
-        let mode = self.settings.approval_mode.next();
-        self.settings.approval_mode = mode;
-        if let Err(error) = config::save_approval_mode(&self.settings.dir, mode) {
-            self.notice = Some(format!("couldn't save approval_mode: {error:#}"));
+        let permission = self.settings.permission.next();
+        self.settings.permission = permission;
+        self.runtime.set_permission(permission);
+        if let Err(error) = config::save_permission(&self.settings.dir, permission) {
+            self.notice = Some(format!("couldn't save permission: {error:#}"));
         }
     }
 
@@ -776,13 +770,7 @@ impl App {
     /// the list for it, and no approval prompt may be showing (the list replaces the
     /// status line, which carries the prompt).
     fn completions(&self) -> Vec<Completion> {
-        let approving = matches!(
-            self.turn,
-            Some(Turn {
-                phase: Phase::Approving { .. },
-                ..
-            })
-        );
+        let approving = self.pending_prompt().is_some();
         let [input] = self.textarea.lines() else {
             return Vec::new();
         };
@@ -897,29 +885,31 @@ impl App {
         Ok(Flow::Continue)
     }
 
+    /// Show the current permission and the exact host operation awaiting approval.
     fn status_line(&self) -> Line<'static> {
         let mut info = self.settings.endpoint.model.clone();
         if let Some(tokens) = self.context_tokens {
             info.push_str(&format!(" | {} tokens", thousands(tokens)));
         }
-        info.push_str(&format!(" | {}", self.settings.approval_mode.as_str()));
+        info.push_str(&format!(" | {}", self.settings.permission.as_str()));
         if self.settings.tool_reasoning {
             info.push_str(" | tool reasoning");
         }
         let mut spans = vec![Span::styled(info, tui::dim())];
         let activity = match self.turn.as_ref().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
-            Some(Phase::Classifying { .. }) => Some("classifying… (esc to stop)"),
-            Some(Phase::Running { .. }) => Some("running… (esc to stop)"),
+            Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
+                Some("running… (esc to stop)")
+            }
             _ => None,
         };
         if let Some(activity) = activity {
             spans.push(Span::styled(format!(" · {activity}"), tui::dim()));
         }
-        if let Some(Phase::Approving { .. }) = self.turn.as_ref().map(|t| &t.phase) {
+        if let Some(prompt) = self.pending_prompt() {
             spans.push(Span::styled(" · ", tui::dim()));
             spans.push(Span::styled(
-                "allow? (y/n, esc to stop)",
+                format!("allow {}? (y/n, esc to stop)", prompt.operation),
                 Style::default().yellow(),
             ));
         }
@@ -982,7 +972,7 @@ fn build_blocks<'a>(
         }
     };
     let (phase, running) = match turn.map(|t| &t.phase) {
-        Some(Phase::Running { call, output }) => (None, Some((&call.call.id, output))),
+        Some(Phase::Running { call, output, .. }) => (None, Some((&call.call.id, output))),
         phase => (phase, None),
     };
 
@@ -1106,10 +1096,8 @@ fn fyi_calls() -> Vec<ToolCall> {
         .collect()
 }
 
-/// Calls that never need approval in any mode: code made only of the driver's
-/// read-only built-ins `FYI()` and `help()`, as statements separated by `;` or
-/// newlines. Any other code alongside them (`FYI(); os.remove(p)`) is judged
-/// normally, and so is `help(x)`, since its argument is evaluated.
+/// Select pure FYI/help calls for history cleanup. This selector does not grant
+/// permissions: all actual host operations use the runtime's permission checks.
 fn is_exempt(code: &str) -> bool {
     let mut statements = code
         .split([';', '\n'])
@@ -1177,6 +1165,7 @@ fn tool_output_style() -> Style {
     tui::dim()
 }
 
+/// Await the active phase without consuming state when terminal input wins the select.
 async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
     let Some(turn) = turn else {
         return std::future::pending().await;
@@ -1187,15 +1176,15 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
                 StreamEvent::Error("request task ended without a result".to_string())
             }))
         }
-        Phase::Classifying { task, .. } => TurnEvent::Verdict(match task.await {
-            Ok(verdict) => verdict,
+        Phase::Finishing(task) => TurnEvent::Finished(match task.await {
+            Ok(result) => result,
             Err(error) => Err(error.into()),
         }),
         Phase::Running { .. } => match turn.repl.as_mut() {
             Some(repl) => TurnEvent::Repl(repl.next_event().await),
             None => std::future::pending().await,
         },
-        Phase::Idle | Phase::Approving { .. } | Phase::Ready(_) => std::future::pending().await,
+        Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
 }
 

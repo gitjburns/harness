@@ -4,14 +4,14 @@
 # `is_reasoning_call` in src/tool_reasoning.rs). With `[chat] tool_reasoning` on, the
 # app also shows earlier reasoning to the model as such calls, again without running
 # them. Any other code that calls it (`reasoning(x)`, or alongside other statements)
-# goes through approval and runs this body.
+# runs this body; other operations retain their normal permission checks.
 #
 # This definition still matters: `help()` lists it, so the docstring is what the model
 # reads about the function. Edit the docstring freely, but keep the body a no-op that
 # prints nothing and returns None, or the app's `(no output)` answer becomes a lie.
 
 
-@register
-def reasoning(text):
+# Keep the interpreted form equivalent to the app's exact-call shortcut.
+def reasoning(text: str) -> None:
     """Record your reasoning as part of the conversation. Has no other effect; returns None."""
     pass

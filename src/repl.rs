@@ -1,130 +1,488 @@
-//! The REPL process: a Python driver (`repl_driver.py`, embedded) run locally and
-//! unsandboxed in the working directory. One process lives for one turn.
+//! Per-turn Monty sessions. A driver task owns the checkout and all host suspensions.
 
-use std::path::Path;
-use std::process::Stdio;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
-use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use monty_pool::{
+    Checkout, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue,
+    TurnEvent, on_print_sync,
+};
+use monty_types::{ExcType, MontyObject, NameLookupResult, NamedValues, ResourceLimits};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
-const DRIVER: &str = include_str!("repl_driver.py");
-
-/// Function library directory, inside the harness directory.
-const LIBRARY_DIR: &str = "replib";
+use crate::config::{Permission, Settings};
+use crate::host::{self, HostConfig, HostContext};
+use crate::hostfs::{self, FsAction};
 
 pub enum ReplEvent {
-    /// Output as it is written, in order, from the code and anything it started.
+    /// Code output in execution order. The app applies its existing result truncation.
     Output(String),
-    /// The call finished. `value` is the repr of a trailing expression, if not None.
+    /// Answer only this suspension; dropping the sender cancels the pending operation.
+    Prompt {
+        operation: String,
+        answer: oneshot::Sender<bool>,
+    },
+    /// Facts for the app's persistent failure log and display-only occurrence note.
+    Failure {
+        kind: &'static str,
+        message: String,
+        code: String,
+    },
+    /// Exactly one completion follows each accepted call.
     Done {
         value: Option<String>,
         error: Option<String>,
     },
 }
 
-#[derive(Deserialize)]
-struct DriverMessage {
-    output: Option<String>,
-    #[serde(default)]
-    done: bool,
-    value: Option<String>,
-    error: Option<String>,
+/// App-lifetime pool and settings. The app creates this before entering the TUI.
+pub struct Runtime {
+    pool: Arc<Pool>,
+    config: Arc<HostConfig>,
+    repl_config: Arc<ReplConfig>,
+    repo: PathBuf,
+    /// Clone the opened directory capability across feeds; never reopen its path.
+    mount: MountSpec,
+    permission: watch::Sender<Permission>,
+    memory_mb: usize,
 }
 
+impl Runtime {
+    /// Start one idle worker and validate the repository and byte-limit conversion once.
+    pub async fn new(settings: &Settings) -> anyhow::Result<Self> {
+        let repo = std::env::current_dir()
+            .context("finding repository directory")?
+            .canonicalize()
+            .context("resolving repository directory")?;
+        let mount = MountSpec::new(
+            repo.to_str()
+                .context("repository directory is not valid UTF-8")?,
+            &repo,
+            MountSpecMode::ReadWrite,
+        )
+        .context("opening repository mount")?;
+        let bytes = settings
+            .max_memory_mb
+            .checked_mul(1024 * 1024)
+            .context("repl.max_memory_mb is too large to represent in bytes")?;
+        let mut pool_config =
+            PoolConfig::subprocess(std::env::current_exe().context("locating harness executable")?);
+        pool_config.min_processes = 1;
+        pool_config.max_processes = 1;
+        let pool = Pool::new(pool_config)
+            .await
+            .context("starting Monty worker pool")?;
+        let repl_config = ReplConfig {
+            limits: Some(
+                ResourceLimits::default()
+                    .max_memory(bytes)
+                    .max_suspensions(usize::MAX),
+            ),
+            // Monty's typing history loses partially executed snippets and narrows
+            // earlier bindings. Use the interpreter's surviving state on every call;
+            // host argument validation and per-operation permissions still apply.
+            type_check: false,
+            type_check_stubs: None,
+            ..ReplConfig::default()
+        };
+        let (permission, _) = watch::channel(settings.permission);
+        Ok(Self {
+            pool: Arc::new(pool),
+            config: Arc::new(HostConfig::new(settings)),
+            repl_config: Arc::new(repl_config),
+            repo,
+            mount,
+            permission,
+            memory_mb: settings.max_memory_mb,
+        })
+    }
+
+    /// Publish the effective level immediately; each operation reads the latest value.
+    pub fn set_permission(&self, permission: Permission) {
+        self.permission.send_replace(permission);
+    }
+
+    /// A fresh driver per turn; checkout and library load occur with its first call.
+    pub fn start(&self) -> Repl {
+        let (commands, incoming) = mpsc::unbounded_channel();
+        let (events, output) = mpsc::unbounded_channel();
+        let driver = Driver {
+            pool: self.pool.clone(),
+            config: self.repl_config.clone(),
+            checkout: None,
+            mount: self.mount.clone(),
+            memory_mb: self.memory_mb,
+            host: HostContext {
+                repo: self.repo.clone(),
+                config: self.config.clone(),
+                permissions: self.permission.subscribe(),
+                events,
+                library: BTreeMap::new(),
+                prompt_tokens: None,
+                code: String::new(),
+            },
+        };
+        Repl {
+            commands,
+            events: output,
+            task: Some(tokio::spawn(driver.run(incoming))),
+        }
+    }
+
+    /// Close idle workers after all turns have finished or been canceled.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+enum DriverCommand {
+    Call {
+        code: String,
+        prompt_tokens: Option<u64>,
+    },
+    Finish,
+}
+
+/// App-side handle. Drop/kill cancels; normal completion must explicitly call finish.
 pub struct Repl {
-    child: Child,
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
-    /// The driver calls `setsid()` first thing, becoming the leader of a new session
-    /// and process group whose id is its pid. Killing the group also kills any
-    /// programs the code started.
-    pgid: u32,
+    commands: mpsc::UnboundedSender<DriverCommand>,
+    events: mpsc::UnboundedReceiver<ReplEvent>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Repl {
-    /// `harness_dir` holds `replib/`; the process itself runs in the working directory.
-    pub fn start(output_limit: usize, model: &str, harness_dir: &Path) -> anyhow::Result<Repl> {
-        let mut child = Command::new("python3")
-            .arg("-u")
-            .arg("-c")
-            .arg(DRIVER)
-            .env("HARNESS_OUTPUT_LIMIT", output_limit.to_string())
-            .env("HARNESS_MODEL", model)
-            .env("HARNESS_LIBRARY_DIR", harness_dir.join(LIBRARY_DIR))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // The driver redirects fd 2 into its capture pipe at startup; anything
-            // written before that must not reach the terminal UI.
-            .stderr(Stdio::null())
-            // No `process_group(0)`: `setsid()` in the driver fails for a process that
-            // already leads a group.
-            .kill_on_drop(true)
-            .spawn()
-            .context("starting python3")?;
-        let pgid = child.id().context("python3 exited immediately")?;
-        let stdin = child.stdin.take().context("no stdin")?;
-        let stdout = child.stdout.take().context("no stdout")?;
-        Ok(Repl {
-            child,
-            stdin,
-            lines: BufReader::new(stdout).lines(),
-            pgid,
-        })
-    }
-
-    /// Run `code`. `prompt_tokens` is the latest reported prompt size, sent with every
-    /// call so `FYI()` reports the count current at call time.
+    /// Queue code without waiting on execution, library loading, or an approval.
     pub async fn send(&mut self, code: &str, prompt_tokens: Option<u64>) -> anyhow::Result<()> {
-        let line = format!(
-            "{}\n",
-            json!({ "code": code, "prompt_tokens": prompt_tokens })
-        );
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .context("sending code to the REPL")
+        self.commands
+            .send(DriverCommand::Call {
+                code: code.to_owned(),
+                prompt_tokens,
+            })
+            .map_err(|_| anyhow::anyhow!("REPL driver is no longer running"))
     }
 
-    /// The next event of the call in progress. An error means the process died.
+    /// Cancel-safe receive for the app's event loop; unexpected closure is a driver failure.
     pub async fn next_event(&mut self) -> anyhow::Result<ReplEvent> {
-        let Some(line) = self
-            .lines
-            .next_line()
+        self.events
+            .recv()
             .await
-            .context("reading from the REPL")?
-        else {
-            bail!("the REPL process exited");
-        };
-        let message: DriverMessage =
-            serde_json::from_str(&line).with_context(|| format!("bad REPL message: {line}"))?;
-        Ok(if message.done {
-            ReplEvent::Done {
-                value: message.value,
-                error: message.error,
-            }
-        } else {
-            ReplEvent::Output(message.output.unwrap_or_default())
-        })
+            .context("REPL driver exited before reporting completion")
     }
 
-    /// Kill the driver and everything in its process group.
+    /// Return the healthy worker to its pool. Cancellation of this future still aborts it.
+    pub async fn finish(mut self) -> anyhow::Result<()> {
+        self.commands
+            .send(DriverCommand::Finish)
+            .map_err(|_| anyhow::anyhow!("REPL driver stopped before ending its session"))?;
+        if let Some(task) = self.task.as_mut() {
+            task.await.context("joining REPL driver")??;
+        }
+        self.task = None;
+        Ok(())
+    }
+
+    /// Abort drops both the checkout and any active command process-group guard.
     pub fn kill(&mut self) {
-        // `/bin/kill` accepts a negative pid as a process group on macOS and Linux,
-        // which avoids a direct libc dependency.
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{}", self.pgid)])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = self.child.start_kill();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
 impl Drop for Repl {
+    /// A turn abandoned by Esc, exit, or an error must never leave execution detached.
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+struct Driver {
+    pool: Arc<Pool>,
+    config: Arc<ReplConfig>,
+    checkout: Option<Checkout>,
+    host: HostContext,
+    mount: MountSpec,
+    memory_mb: usize,
+}
+
+impl Driver {
+    /// Serialize calls and keep the checkout owned by this abortable task throughout.
+    async fn run(
+        mut self,
+        mut commands: mpsc::UnboundedReceiver<DriverCommand>,
+    ) -> anyhow::Result<()> {
+        while let Some(command) = commands.recv().await {
+            match command {
+                DriverCommand::Call {
+                    code,
+                    prompt_tokens,
+                } => {
+                    self.host.prompt_tokens = prompt_tokens;
+                    let ready = self.initialize().await;
+                    self.host.code = code.clone();
+                    let result = match ready {
+                        Ok(()) => self.evaluate(&code).await,
+                        Err(error) => Err(error),
+                    };
+                    let (value, error) = match result {
+                        Ok(value) => (
+                            if value.as_ref().type_name() == "NoneType" {
+                                None
+                            } else {
+                                Some(value.py_repr())
+                            },
+                            None,
+                        ),
+                        Err(error) => (None, Some(self.report_error(error))),
+                    };
+                    if self
+                        .host
+                        .events
+                        .send(ReplEvent::Done { value, error })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                DriverCommand::Finish => {
+                    if let Some(checkout) = self.checkout.take() {
+                        checkout.finish().await.context("finishing Monty session")?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        // A disconnected app means cancellation, not normal session reuse.
+        Ok(())
+    }
+
+    /// Load each library file once per fresh session; report ordinary load errors and continue.
+    async fn initialize(&mut self) -> Result<(), PoolError> {
+        if self.checkout.is_some() {
+            return Ok(());
+        }
+        self.host.library.clear();
+        self.checkout = Some(self.pool.checkout(&self.config).await?);
+        let directory = self.host.config.dir.join("replib");
+        let mut paths = match library_paths(&directory) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.host
+                    .output(format!("{} failed to load: {error}\n", directory.display()));
+                return Ok(());
+            }
+        };
+        paths.sort();
+        for path in paths {
+            let source = match std::fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.host
+                        .output(format!("{} failed to load: {error}\n", path.display()));
+                    continue;
+                }
+            };
+            self.host.code = source.clone();
+            let functions = match host::library_functions(&source) {
+                Ok(functions) => functions,
+                Err(error) => {
+                    self.host
+                        .output(format!("{} failed to load: {error}\n", path.display()));
+                    continue;
+                }
+            };
+            match self.evaluate(&source).await {
+                Ok(_) => self.host.library.extend(functions),
+                Err(error) if session_lost(&error) => return Err(error),
+                Err(error) => {
+                    let error = self.report_error(error);
+                    self.host
+                        .output(format!("{} failed to load:\n{error}\n", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive suspensions explicitly so no filesystem or command capability bypasses the host.
+    async fn evaluate(&mut self, code: &str) -> Result<MontyObject, PoolError> {
+        let checkout = self
+            .checkout
+            .as_mut()
+            .expect("initialized before evaluating");
+        let events = self.host.events.clone();
+        let mut on_print = on_print_sync(move |_, text| {
+            let _ = events.send(ReplEvent::Output(text.to_owned()));
+        });
+        let mut event = checkout
+            .feed(
+                code,
+                NamedValues::new(),
+                vec![self.mount.clone()],
+                false,
+                &mut on_print,
+            )
+            .await?;
+        loop {
+            event = match event {
+                TurnEvent::Complete(value) => return Ok(value),
+                TurnEvent::NameLookup {
+                    name, object_id, ..
+                } => {
+                    let result = if object_id.is_none() && host::is_host_function(&name) {
+                        NameLookupResult::Value(MontyObject::function(name, None))
+                    } else {
+                        NameLookupResult::Undefined
+                    };
+                    checkout.resume_name_lookup(result, &mut on_print).await?
+                }
+                TurnEvent::FunctionCall {
+                    function_name,
+                    args,
+                    object_id,
+                    call_id,
+                    ..
+                } => {
+                    let result = if object_id.is_none() {
+                        host::dispatch(&function_name, &args, &mut self.host).await
+                    } else {
+                        ResumeValue::NotFound
+                    };
+                    checkout
+                        .resume(
+                            checked_reply(result, call_id, &function_name),
+                            &mut on_print,
+                        )
+                        .await?
+                }
+                TurnEvent::OsCall {
+                    function_name,
+                    args,
+                    call_id,
+                    ..
+                } => match hostfs::handle(&function_name, &args, &self.host) {
+                    FsAction::Reply(result) => {
+                        checkout
+                            .resume(
+                                checked_reply(result, call_id, &function_name),
+                                &mut on_print,
+                            )
+                            .await?
+                    }
+                    FsAction::Mounts => match checkout.resume_from_mounts(&mut on_print).await? {
+                        Some(event) => event,
+                        None => {
+                            checkout
+                                .resume(ResumeValue::NotHandled, &mut on_print)
+                                .await?
+                        }
+                    },
+                },
+                // Host functions are synchronous from Python's perspective: no branch
+                // registers a Future, so pending external futures indicate a broken protocol.
+                TurnEvent::ResolveFutures { .. } => {
+                    return Err(PoolError::Protocol(
+                        "unexpected external futures: no host function registered one".into(),
+                    ));
+                }
+            };
+        }
+    }
+
+    /// Preserve ordinary Python errors; discard lost sessions without replaying the failed code.
+    fn report_error(&mut self, error: PoolError) -> String {
+        match &error {
+            PoolError::Typing(message) => self.host.failure("type check", message.clone()),
+            PoolError::Runtime(exception)
+                if exception.exc_type() == ExcType::NotImplementedError =>
+            {
+                self.host.failure("unsupported", exception.to_string());
+            }
+            _ => {}
+        }
+        if session_lost(&error) {
+            self.checkout = None;
+            self.host.library.clear();
+            let cause = if memory_limit(&error) {
+                format!("REPL memory limit of {} MiB exceeded", self.memory_mb)
+            } else {
+                format!("REPL worker crashed: {error}")
+            };
+            format!(
+                "[{cause}. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]"
+            )
+        } else {
+            error.to_string()
+        }
+    }
+}
+
+/// Monty 1.0.0 reports soft-budget and allocator failures as MemoryError text,
+/// without a structured resource-error tag. Both require discarding the session.
+fn memory_limit(error: &PoolError) -> bool {
+    matches!(error, PoolError::Runtime(exception)
+        if exception.exc_type() == ExcType::MemoryError
+        && exception.message().is_some_and(|message|
+            message == "the worker exceeded its memory limit and was terminated"
+            || message.starts_with("memory limit exceeded: ")))
+}
+
+/// Only typing rejections and ordinary Python exceptions preserve a usable checkout.
+fn session_lost(error: &PoolError) -> bool {
+    memory_limit(error) || !matches!(error, PoolError::Typing(_) | PoolError::Runtime(_))
+}
+
+/// Reject an oversized answer while the suspension is still answerable with a small error.
+/// Monty 1.0.0 exposes no public pending-state check after resume fails. Match its
+/// ResumeCall envelope and use its size calculator, never retry an executed operation.
+fn checked_reply(value: ResumeValue, call_id: u32, function_name: &str) -> ResumeValue {
+    use monty_proto::{exceeds_max_frame_len, ext_result_to_proto, pb};
+    use monty_types::ExtFunctionResult;
+
+    let result = match &value {
+        ResumeValue::Return(value) => ExtFunctionResult::Return(value.clone()),
+        ResumeValue::Error(error) => ExtFunctionResult::Error(error.clone()),
+        ResumeValue::NotFound => ExtFunctionResult::NotFound(function_name.to_owned()),
+        // These carry no variable-sized payload and always fit the protocol frame.
+        ResumeValue::NotHandled | ResumeValue::Future => return value,
+    };
+    let (result, values) = ext_result_to_proto(result);
+    let request = pb::ParentRequest {
+        kind: Some(pb::parent_request::Kind::ResumeCall(pb::ResumeCall {
+            call_id,
+            result: Some(result),
+            values,
+        })),
+        trace_parent: None,
+    };
+    match exceeds_max_frame_len(&request) {
+        Some(len) => ResumeValue::Error(host::exception(
+            ExcType::RuntimeError,
+            format!(
+                "host reply frame of {len} bytes exceeds the maximum of {} bytes; the host operation is not retried and any completed effects remain",
+                monty_proto::MAX_FRAME_LEN
+            ),
+        )),
+        None => value,
+    }
+}
+
+/// Enumerate optional library files; all errors other than an absent directory remain visible.
+fn library_paths(directory: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => bail!("reading library directory {}: {error}", directory.display()),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.context("reading library directory entry")?.path();
+        if path.extension().is_some_and(|extension| extension == "py") {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }

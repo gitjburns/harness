@@ -4,13 +4,13 @@ A terminal coding agent for OpenAI-compatible chat completions endpoints. The mo
 
 The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
-> **The REPL runs Python on your machine, as you, with no sandbox.** Approval modes (below) control what runs without asking you.
+The REPL uses Monty, a sandboxed Python-subset interpreter. Repository filesystem access follows the permission level below. **Commands launched with `run()` are host processes running as you, outside the REPL sandbox.**
 
 ## Setup
 
-Requires a Rust toolchain and `python3` on your `PATH`.
+Requires a Rust toolchain. The Monty interpreter is built into the app.
 
-The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, and `replib/` (see Library functions). They are shared by every repository you run it in. `~/.harness` can be a symlink to a checkout of this repo.
+The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, `replib/`, optional `repl-notes.md`, and `failures.jsonl`. They are shared by every repository you run it in. `~/.harness` can be a symlink to a checkout of this repo.
 
 Create `~/.harness/config.toml`:
 
@@ -20,21 +20,29 @@ base_url = "http://localhost:8000/v1"
 model = "your-model-name"
 api_key_env = "OPENAI_API_KEY"   # optional; omit for servers that need no key
 
-[chat]                           # optional
+[chat]
 prompt = """
-...system message sent at the start of every request...
+...optional system message sent at the start of every request...
 """
 tool_reasoning = false           # see Tool reasoning; /tool-reasoning switches it
 
-[classifier]
-prompt = """
-...instructions for judging whether code is safe to run; see this repo's config.toml...
+[repl]
+tool_description = """
+Execute Python in a sandboxed Monty REPL. State lasts for one turn. Call help() for available functions and libraries. Use run() for host commands.
 """
-
-[repl]                           # optional
-approval_mode = "auto"           # allow | ask | auto
+permission = "none"              # none | read-only | read-write
+max_memory_mb = 2048             # worker memory limit in MiB
 output_limit = 100000            # bytes of output per call returned to the model
+
+[commands]
+deny = ["git", "rm"]             # always denied, even if also allowed
+env_filter = ["GITHUB_TOKEN"]    # exact names removed from command environments
+
+[commands.allow]
+# cargo = "/absolute/path/to/cargo"  # configured commands run without asking
 ```
+
+These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[commands.allow]` even when empty. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. See `config.toml.example` for a complete example.
 
 If the endpoint needs a key, put it in `~/.harness/.env` (and keep that file out of version control):
 
@@ -42,7 +50,7 @@ If the endpoint needs a key, put it in `~/.harness/.env` (and keep that file out
 OPENAI_API_KEY=sk-...
 ```
 
-A variable already set in your shell takes precedence over `.env`.
+A variable already set in your shell takes precedence over `.env`. The app reads `.env` privately; it does not export those values to command processes.
 
 ## Running
 
@@ -61,27 +69,29 @@ The earlier conversation is shown, and new messages are added to the same file.
 
 Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: the model's reasoning appears dimmed, followed by the answer.
 
-When the model uses the REPL, you see the code, then (in `auto` mode) the safety verdict, then the output as it runs. The model keeps going, calling the REPL as many times as it needs, until it answers without one. Esc stops it at any point.
+When the model uses the REPL, you see the code and its printed output as it runs. Host commands return captured output when they finish. The model keeps calling the REPL until it answers without one. Esc stops it at any point.
 
-The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the approval mode.
+The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals show the operation in yellow; press `y` to allow or `n` to deny.
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
 **Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context.
 
-**Approval exemptions.** All synthetic tool calls, including `FYI()` and `help()` and any added in the future, never require approval, whether the app generates them or the model calls them explicitly. This applies in every approval mode and sandbox permission level. The exemption covers only those calls: unrelated code bundled with them, including code evaluated in arguments, remains subject to the normal approval rules.
+**Approval exemptions.** All synthetic tool calls, including `FYI()` and `help()` and any added in the future, never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules.
 
-### Approval modes
+### Filesystem permissions
 
-Shift+Tab cycles the mode; the choice is saved to `config.toml`.
+Shift+Tab cycles `none → read-only → read-write`; the choice is saved to `config.toml` and applies to the next filesystem operation, including during a call.
 
-| Mode | What happens to each non-exempt REPL call |
+| Level | Repository filesystem access |
 |---|---|
-| `ask` | You approve every call with `y` or deny it with `n`. |
-| `auto` | A separate request to the model judges the code against `[classifier] prompt`. Safe code runs, unsafe code is blocked, and anything else asks you. |
-| `allow` | Every call runs without asking. |
+| `none` | Reads and writes are denied. |
+| `read-only` | Reads are allowed; writes are denied. |
+| `read-write` | Reads and writes are allowed. |
 
-`reasoning()` is not a synthetic tool call; it has a separate approval exemption. A call that is only `reasoning("...")` on a plain string never needs approval, in any mode or permission level, and always succeeds (see Library functions). It cannot exempt unrelated code bundled with it.
+The repository is the directory from which you launch the app. Access outside it is denied at every level, including traversal and symlink escapes, without an approval prompt. Monty also rejects absolute symlink targets inside the repository; use relative targets. `Path.resolve()` normalizes paths lexically rather than following host symlinks.
+
+Host command approvals are independent of these levels (see Host commands). `reasoning()` is not synthetic: a standalone `reasoning("...")` on a plain string has its own approval exemption at every level. It cannot exempt unrelated code.
 
 ### Keys
 
@@ -92,8 +102,8 @@ Shift+Tab cycles the mode; the choice is saved to `config.toml`.
 | Ctrl+K | Delete to end of line |
 | Ctrl+U | Delete to start of line |
 | Esc | Stop the model (with the command list open, close the list) |
-| Shift+Tab | Change approval mode |
-| y / n | Allow or deny a REPL call when asked |
+| Shift+Tab | Change filesystem permission |
+| y / n | Allow or deny the pending host operation |
 | PageUp / PageDown | Scroll the conversation a screen |
 | Mouse wheel | Scroll the conversation a line |
 | Mouse drag | Select text; it's copied when you release |
@@ -116,32 +126,52 @@ To send a message that starts with `/`, begin it with a space.
 
 ## The REPL
 
-REPL state (variables, imports) lasts for one turn: from your message until the model's final answer. Each turn starts fresh. Calling `help()` in the REPL lists the output limit and any library functions.
+REPL state lasts for one turn: from your message until the model's final answer. Each turn starts fresh. Static type checking is disabled; after an ordinary runtime exception, completed effects and surviving state remain available. A worker crash or memory-limit failure discards that state; the next call starts fresh and reloads the library, with the state loss reported explicitly.
+
+Printed output is followed by the trailing expression's value, when not `None`, and any runtime error. Empty output becomes `(no output)`. Results are capped at `output_limit` bytes on a Unicode character boundary, with a notice stating how many bytes were omitted. The sandbox sees an empty environment.
+
+`help()` lists the output limit, optional guidance from `~/.harness/repl-notes.md`, host functions, loaded public library functions, and allow-listed command names.
+
+### Host commands
+
+`run(argv, cwd=None)` executes a bare command name with literal arguments, without a shell. It returns `{"exit_code": int, "stdout": str, "stderr": str}` and prints nothing. Output is captured until the command finishes; a signal exit uses the negative signal number. Commands have no terminal or interactive stdin. Esc kills the command's process group.
+
+Names in `[commands] deny` are blocked. Names in `[commands.allow]` run the configured absolute executable without asking. Other names are resolved through the app's `PATH` and require approval each time; missing commands produce an error. This is independent of the filesystem permission level.
+
+Commands start in the repository root, independently of sandbox `os.chdir()`. An explicit `cwd` must be relative and contain no `..` components. If its symlinks resolve outside the repository, using that directory requires approval. Commands inherit the app's environment minus the exact names in `env_filter`.
 
 ### Library functions
 
-Library functions are Python functions you provide for the model. They live in `~/.harness/replib/`, one or more `.py` files, loaded in name order at the start of every turn. The model learns about them only from `help()`, which lists each one's signature and docstring.
+Library functions are Monty-compatible Python functions you provide in `~/.harness/replib/*.py`. Files load in name order at the start of every turn. `help()` lists top-level functions whose names do not start with `_`, using their source signatures and docstrings. `lib_source(name)` returns the current contents of `replib/<name>.py`.
 
-**Adding one.** Put it in any file in `replib/` and mark it with `@register` (no import needed):
+**Adding one.** Define a public function in a `.py` file in `replib/`:
 
 ```python
-@register
-def word_count(path):
+from pathlib import Path as _Path
+
+def word_count(path: str) -> int:
     """Count the words in a file."""
-    with open(path) as f:
-        return len(f.read().split())
+    return len(_Path(path).read_text().split())
 ```
 
 **Editing a description.** The docstring is exactly what the model reads, so it is the place to say what a function is for and when to use it. Edit it in place; the change takes effect from the next turn, since each turn starts a fresh REPL.
 
-**Removing one.** Delete the function, or the whole file. Code in `replib/` without `@register` still runs at load, but isn't listed or offered to the model.
+**Removing one.** Delete the function or its file. Top-level code executes during loading; private functions remain callable but are omitted from `help()`.
 
-**Mistakes.** If a file fails to load, its error appears in the output of the turn's first call (the app's own `FYI()`), so you and the model both see it; the other files still load.
+**Mistakes.** Load errors appear in the turn's first call (the app's `FYI()`); other files still load. Failed files are omitted from `help()`. Library code follows the same permissions as other REPL code.
 
-This repo ships one library function, `replib/reasoning.py` (used when `~/.harness` links to this repo; otherwise copy it into `~/.harness/replib/`):
+This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. Use them through the `~/.harness` symlink or copy them into `~/.harness/replib/`:
 
 - `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
 - That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing. Edit its docstring freely (it's what `help()` shows the model), but not its behavior.
+- `glob(pattern, path=None, exclude=(".git", "target", "node_modules"))` returns sorted relative paths.
+- `search(pattern, path=None, glob=None, exclude=(".git", "target", "node_modules"))` finds regex matches and returns `path`, 1-based `line`, and `text` records.
+
+Both file helpers default to `.`, preserve the supplied relative root in results, skip directory symlinks, and reject absolute paths and `..` components in path inputs. Errors propagate rather than silently skipping unreadable files.
+
+### Failure notes
+
+App denials and unsupported Monty operations are appended to `~/.harness/failures.jsonl` with time, session, kind, message, and code. A yellow note under the call shows the failure's first line and occurrence count across sessions. These notes are not sent to the model or saved in conversation files; the tool's error result is.
 
 ## Tool reasoning
 
@@ -162,4 +192,4 @@ Session files hold the conversation exactly as it is sent to the model, includin
 ] }
 ```
 
-Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …), and send them back unchanged. A reply you stop partway through is kept as far as it got. Errors and safety verdicts appear on screen but are not saved.
+Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …), and send them back unchanged. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.

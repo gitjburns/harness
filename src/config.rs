@@ -1,6 +1,6 @@
 //! `config.toml` and `.env`, both read from the harness directory (`harness_dir`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -8,17 +8,14 @@ use serde::Deserialize;
 
 const CONFIG_FILE: &str = "config.toml";
 const ENV_FILE: &str = ".env";
-const DEFAULT_OUTPUT_LIMIT: usize = 100_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     endpoint: Endpoint,
-    #[serde(default)]
     chat: Chat,
-    classifier: Classifier,
-    #[serde(default)]
     repl: Repl,
+    commands: Commands,
 }
 
 #[derive(Deserialize)]
@@ -32,7 +29,7 @@ struct Endpoint {
     api_key_env: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Chat {
     /// System message sent ahead of the conversation in every chat request, never
@@ -40,55 +37,60 @@ struct Chat {
     prompt: Option<String>,
     /// Send earlier turns' reasoning as `reasoning()` REPL calls (`tool_reasoning`).
     /// Rewritten by `/tool-reasoning`.
-    #[serde(default)]
     tool_reasoning: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Classifier {
-    /// System prompt for the safety classifier. Required even when `approval_mode`
-    /// isn't `auto`, since Shift+Tab can switch to it at any time.
-    prompt: String,
+pub struct Commands {
+    /// Denied names take precedence over allowed names when commands are brokered.
+    pub deny: Vec<String>,
+    /// Exact environment variable names withheld from command processes.
+    pub env_filter: Vec<String>,
+    /// Model-facing command names mapped to absolute executable paths.
+    pub allow: BTreeMap<String, PathBuf>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Repl {
-    #[serde(default)]
-    approval_mode: ApprovalMode,
+    /// Model-facing tool description, required and sent verbatim on every request.
+    tool_description: String,
+    permission: Permission,
+    /// Worker memory limit in MiB; conversion to bytes belongs to the runtime.
+    max_memory_mb: usize,
     /// Maximum bytes of REPL output sent to the model per call.
-    output_limit: Option<usize>,
+    output_limit: usize,
 }
 
-/// How REPL calls are approved.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalMode {
-    /// Every call runs without asking.
-    Allow,
-    /// Every call asks the user.
-    Ask,
-    /// The classifier decides; inconclusive calls ask the user.
-    #[default]
-    Auto,
+/// REPL filesystem access inside the repository; outside access is denied at every level.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permission {
+    /// Deny repository reads and writes.
+    None,
+    /// Allow repository reads, deny writes.
+    ReadOnly,
+    /// Allow repository reads and writes.
+    ReadWrite,
 }
 
-impl ApprovalMode {
+impl Permission {
+    /// The configuration spelling, also shown in the status line.
     pub fn as_str(self) -> &'static str {
         match self {
-            ApprovalMode::Allow => "allow",
-            ApprovalMode::Ask => "ask",
-            ApprovalMode::Auto => "auto",
+            Permission::None => "none",
+            Permission::ReadOnly => "read-only",
+            Permission::ReadWrite => "read-write",
         }
     }
 
-    /// Shift+Tab order: ask → auto → allow → ask.
+    /// Shift+Tab order: none → read-only → read-write → none.
     pub fn next(self) -> Self {
         match self {
-            ApprovalMode::Ask => ApprovalMode::Auto,
-            ApprovalMode::Auto => ApprovalMode::Allow,
-            ApprovalMode::Allow => ApprovalMode::Ask,
+            Permission::None => Permission::ReadOnly,
+            Permission::ReadOnly => Permission::ReadWrite,
+            Permission::ReadWrite => Permission::None,
         }
     }
 }
@@ -107,8 +109,10 @@ pub struct Settings {
     pub endpoint: ResolvedEndpoint,
     pub chat_prompt: Option<String>,
     pub tool_reasoning: bool,
-    pub classifier_prompt: String,
-    pub approval_mode: ApprovalMode,
+    pub repl_tool_description: String,
+    pub permission: Permission,
+    pub max_memory_mb: usize,
+    pub commands: Commands,
     pub output_limit: usize,
 }
 
@@ -120,6 +124,7 @@ pub fn harness_dir() -> anyhow::Result<PathBuf> {
         .context("can't find the home directory")
 }
 
+/// Require explicit operational settings and resolve credentials without exporting secrets.
 pub fn load(dir: &Path) -> anyhow::Result<Settings> {
     let config_path = dir.join(CONFIG_FILE);
     let text = std::fs::read_to_string(&config_path)
@@ -127,9 +132,20 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
     let config: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
 
-    // `.env` is read privately, never added to the process environment, so the REPL
-    // (which inherits that environment) can't see its secrets. A missing `.env` is
-    // fine.
+    // Command execution must use the configured executable, never resolve an allow
+    // entry relative to the repository or through PATH.
+    for (name, path) in &config.commands.allow {
+        if !path.is_absolute() {
+            bail!(
+                "{}: commands.allow.{name} must be an absolute path, got {}",
+                config_path.display(),
+                path.display()
+            );
+        }
+    }
+
+    // `.env` is read privately, never exported to the app's environment or its
+    // child processes. A missing `.env` is fine.
     let env_path = dir.join(ENV_FILE);
     let mut dotenv = HashMap::new();
     if env_path.exists() {
@@ -167,15 +183,17 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         },
         chat_prompt: config.chat.prompt,
         tool_reasoning: config.chat.tool_reasoning,
-        classifier_prompt: config.classifier.prompt,
-        approval_mode: config.repl.approval_mode,
-        output_limit: config.repl.output_limit.unwrap_or(DEFAULT_OUTPUT_LIMIT),
+        repl_tool_description: config.repl.tool_description,
+        permission: config.repl.permission,
+        max_memory_mb: config.repl.max_memory_mb,
+        commands: config.commands,
+        output_limit: config.repl.output_limit,
     })
 }
 
-/// Persist `approval_mode` (Shift+Tab).
-pub fn save_approval_mode(dir: &Path, mode: ApprovalMode) -> anyhow::Result<()> {
-    save_setting(dir, "repl", "approval_mode", mode.as_str().into())
+/// Persist `permission` (Shift+Tab).
+pub fn save_permission(dir: &Path, permission: Permission) -> anyhow::Result<()> {
+    save_setting(dir, "repl", "permission", permission.as_str().into())
 }
 
 /// Persist `tool_reasoning` (`/tool-reasoning`).

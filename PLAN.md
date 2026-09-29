@@ -23,6 +23,7 @@ Working log. Behavior contract: `SPEC.md`.
 17. **Tool reasoning (experimental).** `[chat] tool_reasoning` / `/tool-reasoning`: earlier turns' reasoning is sent and drawn as generated reasoning-history entries containing `reasoning("…")` calls with `(no output)` results, built per request from the unchanged session. First library function, `replib/reasoning.py`: a no-op the model is meant to call, listed by `help()`, separately exempt from approval when called alone on a plain string literal; it is not a synthetic tool function.
 18. **Command completion.** Typing `/` lists matching commands (name, description) below the input in place of the status line; Up/Down, Tab, Enter, Esc. One command table (`src/commands.rs`) drives both completion and running.
 19. **Harness directory.** `config.toml`, `.env`, `sessions/`, and `replib/` live in `~/.harness`, so the app runs in any repo. Sessions are flat and named by file name: `/rename <name>` (first command with an argument), `--resume` lists names, `--resume <NAME>` resumes.
+20. **Sandbox.** Monty replaces CPython and the classifier, with repository permissions, brokered commands, library functions, failure logging, and worker recovery. Static type checking is disabled. Essential checks and the user-reported smoke test passed; skipped checks are recorded in `PLAN-sandbox.md`. Library-authoring features remain deferred. Contract: `SPEC-sandbox.md`.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
@@ -31,12 +32,11 @@ Decided against:
 
 ## Next
 
-1. **Sandbox.** Replace the CPython REPL with Monty; permission levels, brokered commands, agent-written library functions, failure log. Design: `SPEC-sandbox.md`.
-2. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
-3. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
-4. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
-5. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
-6. **Harness as teacher.** Turn the failure log (`SPEC-sandbox.md`) into proposed edits to the persistent guidance, for user approval.
+1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
+2. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
+3. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
+4. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
+5. **Harness as teacher.** Turn the failure log (`SPEC-sandbox.md`) into proposed edits to the persistent guidance, for user approval.
 
 ## Open
 

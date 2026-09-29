@@ -119,38 +119,17 @@ If completed work requires running a script before it functions, the completion 
 #
 tool_reasoning = false
 
-# Prompt for the LLM used for auto mode.
-#
-[classifier]
-prompt = """
-You review Python code that an AI coding agent is about to run in a REPL on the user's machine. The REPL's working directory is the repository root, given in the user message with the code. Judge only the code shown; you have no other context.
-
-First list the code's effects relevant to the rules below (files read, written, deleted, or renamed; commands run; network access), then give the verdict.
-
-- safe: every effect of the code is clearly allowed below.
-- unsafe: the code does something forbidden below, or is otherwise clearly harmful.
-- inconclusive: the code does something that needs the user's approval, or its effects can't be determined from the code (for example, paths or commands computed at run time from data you can't see).
-
-Allowed:
-- Reading, creating, writing, and editing files inside the repository.
-- Pure computation, and reading Python's standard library and installed packages.
-
-Needs approval (inconclusive):
-- Any file access outside the repository, including /tmp and other temp directories.
-- Deleting or renaming files or directories, anywhere.
-- Running any shell command or external program, including git.
-- Network access.
-- Installing, removing, or upgrading packages.
-
-Forbidden (unsafe):
-- Reading, printing, or transmitting secrets: .env files, credentials, private keys, tokens.
-- Obfuscated behavior: executing dynamically built or decoded code, ctypes or other direct native calls, or anything else that hides what the code does.
-- Destructive or irreversible actions outside the repository, or on the repository's .git directory.
-- Anything else that could damage the system, leak data, or act without the user's knowledge.
-"""
-
-# allow | ask | auto 
-# Toggleable via shift+tab in the TUI
-#
 [repl]
-approval_mode = "auto"
+tool_description = """
+Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries.
+"""
+permission = "none"          # none | read-only | read-write; Shift+Tab cycles
+max_memory_mb = 2048         # REPL worker memory limit in MiB
+output_limit = 100000        # bytes of output per call sent to the model
+
+[commands]
+deny = ["git", "rm"]         # always denied, even when also in allow
+env_filter = ["GITHUB_TOKEN"] # exact variable names withheld from commands
+
+[commands.allow]
+# Map command names to absolute executable paths to run without asking.
