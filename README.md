@@ -42,7 +42,7 @@ env_filter = ["GITHUB_TOKEN"]    # exact names removed from command environments
 # cargo = "/absolute/path/to/cargo"  # configured commands run without asking
 ```
 
-These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[commands.allow]` even when empty. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. See `config.toml.example` for a complete example.
+These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[commands.allow]` even when empty. Also copy the required `[theme]` table from `config.toml.example`: its foreground colors must be `#RRGGBB` strings. Colors load at startup without dimming or background changes. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. See `config.toml.example` for a complete example.
 
 Optional `[endpoint.parameters]` entries are sent as top-level request fields. Uncomment the table heading and desired values in `config.toml` to enable overrides:
 
@@ -89,11 +89,11 @@ This also works with `--resume <NAME>`. The text is used verbatim, including an 
 
 ## Using it
 
-Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: the model's reasoning appears dimmed, followed by the answer.
+Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: reasoning uses `theme.reasoning`, followed by the answer in `theme.assistant`.
 
 When the model uses the REPL, its code appears as the tool-call arguments stream in. Execution waits for the complete response; printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling the REPL until it answers without one. Esc stops it at any point.
 
-The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals show the operation in yellow; press `y` to allow or `n` to deny.
+The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals use `theme.approval`; press `y` to allow or `n` to deny.
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
@@ -201,7 +201,7 @@ Both file helpers default to `.`, preserve the supplied relative root in results
 
 ### Failure notes
 
-App denials and unsupported Monty operations are appended to `~/.harness/failures.jsonl` with time, session, kind, message, and code. A yellow note under the call shows the failure's first line and occurrence count across sessions. These notes are not sent to the model or saved in conversation files; the tool's error result is.
+App denials and unsupported Monty operations are appended to `~/.harness/failures.jsonl` with time, session, kind, message, and code. A note in `theme.warning` under the call shows the failure's first line and occurrence count across sessions. These notes are not sent to the model or saved in conversation files; the tool's error result is.
 
 ## Tool reasoning
 

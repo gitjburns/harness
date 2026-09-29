@@ -34,6 +34,19 @@ model = "your-description-model"
 # repetition_penalty = 1.1
 # max_tokens = 8192
 
+[theme]
+system = "#999999"
+user = "#99CCFF"
+assistant = "#FFFFFF"
+reasoning = "#FF9933"
+tool_call = "#3399FF"
+tool_result = "#FFFFFF"
+approval = "#99CCFF"
+warning = "#FFCC00"
+error = "#FF6666"
+status = "#999999"
+input = "#FFFFFF"
+
 # System prompt
 #
 [chat]

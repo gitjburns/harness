@@ -74,12 +74,12 @@ Every file operation reaches the app as an OS call and is checked before it is s
 
 - App denials and `NotImplementedError` from Monty are appended to `~/.harness/failures.jsonl`: `{"time", "session", "kind", "message", "code"}`, `kind` one of `denied`, `unsupported`. Existing `type check` records remain readable.
 - Counts per `(kind, first line of message)` are loaded at startup and kept in memory.
-- Each failure shows a yellow note under its call: `<kind>: <first line> (seen N times)`, N including this one. Notes are never saved or sent.
+- Each failure shows a note in `theme.warning` under its call: `<kind>: <first line> (seen N times)`, N including this one. Notes are never saved or sent.
 
 ## Terminal UI
 
 - Status line: `<model> | N tokens | <permission>`, ` | tool reasoning` while on; activity as before without ` · classifying…`.
-- Prompts show in the status line in yellow: `allow <operation>? (y/n, esc to stop)`.
+- Prompts show in the status line in `theme.approval`: `allow <operation>? (y/n, esc to stop)`.
 - Enabled approval descriptions issue one independent, non-streaming chat-completions request with the substituted template as its sole user message and no tools or chat history. `${command}` is JSON describing only the pending operation: resolved executable, arguments, and working directory for command execution; the resolved directory for a directory approval.
 - The original call stays visible. A wrapped, display-only block beneath it shows `Generating description…`, then `Description: <text>` or `Description unavailable: <error>`. Approval keys remain active throughout. Resolving or abandoning the approval removes the block and cancels pending generation; results cannot attach to another approval. Descriptions are not saved or sent to the chat model.
 - Shift+Tab cycles `none → read-only → read-write`, saved to `[repl] permission`.

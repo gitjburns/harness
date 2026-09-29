@@ -13,8 +13,10 @@ pub enum InputAction {
     CycleMode,
 }
 
-pub fn new_textarea() -> TextArea<'static> {
+/// Apply the configured input foreground while preserving the textarea's editing highlights.
+pub fn new_textarea(theme: &crate::config::Theme) -> TextArea<'static> {
     let mut textarea = TextArea::default();
+    textarea.set_style(theme.input);
     textarea.set_wrap_mode(WrapMode::Word);
     textarea.set_cursor_line_style(ratatui::style::Style::default());
     // No block: the terminal layer draws the top rule and `> ` prompt around it.

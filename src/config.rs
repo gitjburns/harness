@@ -17,6 +17,56 @@ struct Config {
     repl: Repl,
     commands: Commands,
     approval_description: Option<ApprovalDescription>,
+    theme: Theme,
+}
+
+/// Explicit foreground-only styles. No names, terminal defaults, or dim modifiers are accepted.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Theme {
+    #[serde(deserialize_with = "theme_style")]
+    pub system: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub user: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub assistant: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub reasoning: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub tool_call: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub tool_result: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub approval: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub warning: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub error: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub status: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub input: ratatui::style::Style,
+}
+
+/// Reject malformed colors before slicing, and resolve RGB without terminal color-name mappings.
+fn theme_style<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ratatui::style::Style, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 7
+        || !value.starts_with('#')
+        || !value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(serde::de::Error::custom(
+            "expected a color in #RRGGBB format",
+        ));
+    }
+    let rgb = u32::from_str_radix(&value[1..], 16).map_err(serde::de::Error::custom)?;
+    Ok(ratatui::style::Style::new().fg(ratatui::style::Color::Rgb(
+        (rgb >> 16) as u8,
+        (rgb >> 8) as u8,
+        rgb as u8,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -135,6 +185,7 @@ pub struct Settings {
     pub commands: Commands,
     pub output_limit: usize,
     pub approval_description: Option<ApprovalDescriptionSettings>,
+    pub theme: Theme,
 }
 
 /// `~/.harness`: config, `.env`, sessions, and `replib/`, shared by every directory the
@@ -196,6 +247,7 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         dir: dir.to_path_buf(),
         endpoint,
         approval_description,
+        theme: config.theme,
         chat_prompt: config.chat.prompt,
         tool_reasoning: config.chat.tool_reasoning,
         repl_tool_description: config.repl.tool_description,
@@ -517,5 +569,46 @@ mod tests {
             assert_eq!(resolved.api_key.as_deref(), Some("test-value"));
         }
         assert_eq!(dotenv.len(), 1);
+    }
+
+    /// RGB input is exact and foreground-only; all roles must be configured explicitly.
+    #[test]
+    fn theme_requires_complete_hex_palette() {
+        let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        let valid = config["theme"].clone();
+        for invalid in [
+            "magenta",
+            "default",
+            "#abc",
+            "#12345678",
+            "123456",
+            "#GG1234",
+            " #123456",
+            "#éabcd",
+        ] {
+            let mut theme = valid.clone();
+            theme["reasoning"] = invalid.into();
+            let result: Result<Theme, _> = theme.try_into();
+            assert!(result.is_err(), "accepted invalid color: {invalid}");
+        }
+        for role in valid.as_table().unwrap().keys() {
+            let mut theme = valid.clone();
+            theme.as_table_mut().unwrap().remove(role);
+            let result: Result<Theme, _> = theme.try_into();
+            assert!(result.is_err(), "accepted missing role: {role}");
+        }
+        let mut lower = valid;
+        lower["reasoning"] = "#d7afff".into();
+        let theme: Theme = lower.try_into().unwrap();
+        assert_eq!(
+            theme.reasoning.fg,
+            Some(ratatui::style::Color::Rgb(215, 175, 255))
+        );
+        assert!(theme.reasoning.add_modifier.is_empty());
+        assert!(theme.reasoning.bg.is_none());
+        let mut missing = config;
+        missing.as_table_mut().unwrap().remove("theme");
+        let result: Result<Config, _> = missing.try_into();
+        assert!(result.is_err());
     }
 }

@@ -25,14 +25,14 @@ use tokio::task::JoinHandle;
 
 use crate::client::{self, StreamEvent};
 use crate::commands::{self, Action, Completion};
-use crate::config::{self, Settings};
+use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
-use crate::tui::{self, Tui};
+use crate::tui::Tui;
 
 const STOPPED: &str = "[stopped by user]";
 
@@ -44,13 +44,14 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     let failures = FailureLog::load(&settings.dir)?;
     let runtime = Runtime::new(&settings).await?;
     let mut tui = Tui::enter()?;
+    let textarea = input::new_textarea(&settings.theme);
     let mut app = App {
         settings,
         runtime,
         failures,
         session,
         http: reqwest::Client::new(),
-        textarea: input::new_textarea(),
+        textarea,
         view: View::default(),
         notes: Vec::new(),
         turn: None,
@@ -256,8 +257,15 @@ impl App {
                 &self.notes,
                 self.turn.as_ref(),
                 self.settings.tool_reasoning,
+                &self.settings.theme,
             );
-            tui.draw(&blocks, &mut self.view, &self.textarea, &footer)?;
+            tui.draw(
+                &blocks,
+                &mut self.view,
+                &self.textarea,
+                &footer,
+                &self.settings.theme,
+            )?;
             // Biased toward input so keys (Esc above all) are handled before more
             // output from a fast stream.
             let step = tokio::select! {
@@ -588,7 +596,7 @@ impl App {
                 self.note(
                     anchor,
                     format!("{kind}: {first_line} (seen {count} times)"),
-                    Style::new().yellow(),
+                    self.settings.theme.warning,
                 );
                 return Ok(());
             }
@@ -685,7 +693,7 @@ impl App {
 
         if let Some(error) = error {
             let end = Anchor::After(self.session.messages.len());
-            self.note(end, format!("error: {error}"), Style::new().red());
+            self.note(end, format!("error: {error}"), self.settings.theme.error);
         }
         match first_error {
             Some(e) => Err(e),
@@ -895,13 +903,16 @@ impl App {
                 let name = format!("  {:width$}   ", completion.spelling);
                 let description = completion.command.description;
                 if index == selected {
-                    let reversed = Style::default().reversed();
+                    let reversed = self.settings.theme.status.reversed();
                     Line::from(vec![
                         Span::styled(name, reversed),
                         Span::styled(description, reversed),
                     ])
                 } else {
-                    Line::from(vec![Span::raw(name), Span::styled(description, tui::dim())])
+                    Line::from(vec![
+                        Span::styled(name, self.settings.theme.status),
+                        Span::styled(description, self.settings.theme.status),
+                    ])
                 }
             })
             .collect()
@@ -974,7 +985,8 @@ impl App {
         if self.settings.tool_reasoning {
             info.push_str(" | tool reasoning");
         }
-        let mut spans = vec![Span::styled(info, tui::dim())];
+        let status = self.settings.theme.status;
+        let mut spans = vec![Span::styled(info, status)];
         let activity = match self.turn.as_ref().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
             Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
@@ -983,21 +995,21 @@ impl App {
             _ => None,
         };
         if let Some(activity) = activity {
-            spans.push(Span::styled(format!(" · {activity}"), tui::dim()));
+            spans.push(Span::styled(format!(" · {activity}"), status));
         }
         if let Some(prompt) = self.pending_prompt() {
-            spans.push(Span::styled(" · ", tui::dim()));
+            spans.push(Span::styled(" · ", status));
             spans.push(Span::styled(
                 format!("allow {}? (y/n, esc to stop)", prompt.operation),
-                Style::default().yellow(),
+                self.settings.theme.approval,
             ));
         }
         if self.view.scrolled_up() {
-            spans.push(Span::styled(" · scrolled up (PgDn)", tui::dim()));
+            spans.push(Span::styled(" · scrolled up (PgDn)", status));
         }
         if let Some(notice) = &self.notice {
-            spans.push(Span::styled(" · ", tui::dim()));
-            spans.push(Span::styled(notice.clone(), Style::default().yellow()));
+            spans.push(Span::styled(" · ", status));
+            spans.push(Span::styled(notice.clone(), self.settings.theme.warning));
         }
         Line::from(spans)
     }
@@ -1016,13 +1028,14 @@ fn build_blocks<'a>(
     notes: &'a [Note],
     turn: Option<&'a Turn>,
     tool_reasoning_enabled: bool,
+    theme: &Theme,
 ) -> Vec<Block<'a>> {
-    let blank = |key| Block::new(key, "", plain());
+    let blank = |key| Block::new(key, "", theme.assistant);
     let turn_start = tool_reasoning::turn_start(messages);
     let mut blocks = Vec::new();
     if let Some(system) = system {
-        blocks.push(Block::new(Key::System(0), "system", tui::dim()));
-        blocks.push(Block::new(Key::System(1), system, plain()));
+        blocks.push(Block::new(Key::System(0), "system", theme.system));
+        blocks.push(Block::new(Key::System(1), system, theme.system));
         blocks.push(blank(Key::System(2)));
     }
 
@@ -1065,7 +1078,7 @@ fn build_blocks<'a>(
         match message.role {
             Role::User => {
                 let text = format!("> {}", message.content);
-                blocks.push(Block::new(part(0), text, user_style()));
+                blocks.push(Block::new(part(0), text, theme.user));
                 blocks.push(blank(part(1)));
             }
             Role::Assistant => {
@@ -1077,10 +1090,14 @@ fn build_blocks<'a>(
                     .flatten();
                 if let Some(text) = &converted {
                     let part = |n| Key::Call(tool_reasoning::call_id(i), n);
-                    blocks.push(Block::new(part(0), "REPL", tui::dim()));
-                    blocks.push(Block::new(part(1), tool_reasoning::code(text), plain()));
+                    blocks.push(Block::new(part(0), "REPL", theme.tool_call));
+                    blocks.push(Block::new(
+                        part(1),
+                        tool_reasoning::code(text),
+                        theme.reasoning,
+                    ));
                     let result = tool_reasoning::RESULT;
-                    blocks.push(Block::new(part(2), result, tool_output_style()));
+                    blocks.push(Block::new(part(2), result, theme.tool_result));
                     blocks.push(blank(part(3)));
                 }
                 // Only reasoning, content, and calls are drawn; other fields are sent
@@ -1088,13 +1105,17 @@ fn build_blocks<'a>(
                 let reasoning = message.reasoning().filter(|_| converted.is_none());
                 let has_reasoning = reasoning.is_some();
                 if let Some(reasoning) = reasoning {
-                    blocks.push(Block::new(part(0), reasoning, reasoning_style()));
+                    blocks.push(Block::new(part(0), reasoning, theme.reasoning));
                     if !message.content.is_empty() {
                         blocks.push(blank(part(1)));
                     }
                 }
                 if !message.content.is_empty() {
-                    blocks.push(Block::new(part(2), message.content.as_str(), plain()));
+                    blocks.push(Block::new(
+                        part(2),
+                        message.content.as_str(),
+                        theme.assistant,
+                    ));
                 }
                 if has_reasoning || !message.content.is_empty() {
                     blocks.push(blank(part(3)));
@@ -1104,12 +1125,12 @@ fn build_blocks<'a>(
                     let part = |n| Key::Call(call.id.clone(), n);
                     match code_of(call) {
                         Ok(code) => {
-                            blocks.push(Block::new(part(0), "REPL", tui::dim()));
-                            blocks.push(Block::new(part(1), code, plain()));
+                            blocks.push(Block::new(part(0), "REPL", theme.tool_call));
+                            blocks.push(Block::new(part(1), code, theme.tool_call));
                         }
                         Err(_) => {
                             let arguments = call.function.arguments.as_str();
-                            blocks.push(Block::new(part(0), arguments, plain()))
+                            blocks.push(Block::new(part(0), arguments, theme.tool_call))
                         }
                     }
                     let call_notes = call_notes.get(call.id.as_str()).into_iter().flatten();
@@ -1125,16 +1146,16 @@ fn build_blocks<'a>(
                         blocks.push(Block::new(
                             Key::ApprovalDescription(call.id.clone()),
                             description.text.as_str(),
-                            Style::default().yellow(),
+                            theme.approval,
                         ));
                     }
                     if let Some(result) = results.get(call.id.as_str()) {
-                        blocks.push(Block::new(part(2), *result, tool_output_style()));
+                        blocks.push(Block::new(part(2), *result, theme.tool_result));
                     } else if let Some((id, output, _)) = running
                         && *id == call.id
                         && !output.is_empty()
                     {
-                        blocks.push(Block::new(part(2), output.as_str(), tool_output_style()));
+                        blocks.push(Block::new(part(2), output.as_str(), theme.tool_result));
                     }
                     blocks.push(blank(part(3)));
                 }
@@ -1150,14 +1171,14 @@ fn build_blocks<'a>(
         let reasoning = reasoning_text(&reply.fields);
         let has_reasoning = reasoning.is_some();
         if let Some(reasoning) = reasoning {
-            blocks.push(Block::new(part(0), reasoning, reasoning_style()));
+            blocks.push(Block::new(part(0), reasoning, theme.reasoning));
         }
         let content = reply.fields.get("content").and_then(Value::as_str);
         if let Some(content) = content.filter(|content| !content.is_empty()) {
             if has_reasoning {
                 blocks.push(blank(part(1)));
             }
-            blocks.push(Block::new(part(2), content, plain()));
+            blocks.push(Block::new(part(2), content, theme.assistant));
         }
         if has_reasoning || content.is_some_and(|content| !content.is_empty()) {
             blocks.push(blank(part(3)));
@@ -1189,13 +1210,13 @@ fn build_blocks<'a>(
                 .unwrap_or("");
             // Reuse the completed call's keys; previews never enter execution or persistence.
             let part = |n| Key::Call(id.to_owned(), n);
-            blocks.push(Block::new(part(0), name, tui::dim()));
+            blocks.push(Block::new(part(0), name, theme.tool_call));
             let code = if name == "REPL" {
                 streamed_code(arguments)
             } else {
                 arguments.to_owned()
             };
-            blocks.push(Block::new(part(1), code, plain()));
+            blocks.push(Block::new(part(1), code, theme.tool_call));
             blocks.push(blank(part(3)));
         }
     }
@@ -1403,22 +1424,6 @@ fn thousands(n: u64) -> String {
     out
 }
 
-fn plain() -> Style {
-    Style::new()
-}
-
-fn user_style() -> Style {
-    Style::new().cyan()
-}
-
-fn reasoning_style() -> Style {
-    tui::dim()
-}
-
-fn tool_output_style() -> Style {
-    tui::dim()
-}
-
 /// Await the active phase without consuming state when terminal input wins the select.
 async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
     let Some(turn) = turn else {
@@ -1487,6 +1492,12 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read the explicit example palette instead of maintaining hidden test defaults.
+    fn test_theme() -> Theme {
+        let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        config["theme"].clone().try_into().unwrap()
+    }
 
     /// Every fragment boundary must display only a decoded prefix, including split escapes.
     #[test]
@@ -1566,7 +1577,7 @@ mod tests {
             queue: VecDeque::new(),
             repl: None,
         };
-        let streamed = build_blocks(None, &[], &[], Some(&turn), false);
+        let streamed = build_blocks(None, &[], &[], Some(&turn), false, &test_theme());
         assert_eq!(
             streamed
                 .iter()
@@ -1594,7 +1605,7 @@ mod tests {
             tool_calls: Some(calls),
             ..Message::default()
         }];
-        let completed = build_blocks(None, &messages, &[], None, false);
+        let completed = build_blocks(None, &messages, &[], None, false, &test_theme());
         assert!(
             streamed
                 .iter()
@@ -1641,6 +1652,79 @@ mod tests {
             })
             .await
             .unwrap();
+        }
+    }
+
+    /// Native and converted reasoning retain their own undimmed color beside answers and tools.
+    #[tokio::test]
+    async fn transcript_uses_theme_roles() {
+        let theme = test_theme();
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":"question"},
+            {"role":"assistant","content":"answer","reasoning":"thinking", "tool_calls":[
+                {"id":"call","type":"function","function":{"name":"REPL","arguments":"{\"code\":\"print(1)\"}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call","content":"1"},
+            {"role":"user","content":"next"}
+        ])).unwrap();
+        let blocks = build_blocks(Some("instructions"), &messages, &[], None, false, &theme);
+        for (text, style) in [
+            ("instructions", theme.system),
+            ("> question", theme.user),
+            ("thinking", theme.reasoning),
+            ("answer", theme.assistant),
+            ("print(1)", theme.tool_call),
+            ("1", theme.tool_result),
+        ] {
+            let block = blocks.iter().find(|block| block.text == text).unwrap();
+            assert_eq!(block.style, style);
+            assert!(
+                !block
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::DIM)
+            );
+        }
+        let converted = build_blocks(None, &messages, &[], None, true, &theme);
+        assert_eq!(
+            converted
+                .iter()
+                .find(|block| block.text == "reasoning(\"thinking\")")
+                .unwrap()
+                .style,
+            theme.reasoning
+        );
+        let (_, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(std::future::pending());
+        let turn = Turn {
+            phase: Phase::Streaming(Reply {
+                task,
+                events,
+                fields: serde_json::json!({"reasoning":"live thought","content":"live answer"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }),
+            queue: VecDeque::new(),
+            repl: None,
+        };
+        let live = build_blocks(None, &[], &[], Some(&turn), false, &theme);
+        assert_eq!(
+            live.iter()
+                .find(|block| block.text == "live thought")
+                .unwrap()
+                .style,
+            theme.reasoning
+        );
+        assert_eq!(
+            live.iter()
+                .find(|block| block.text == "live answer")
+                .unwrap()
+                .style,
+            theme.assistant
+        );
+        if let Phase::Streaming(reply) = &turn.phase {
+            reply.task.abort();
         }
     }
 
@@ -1696,7 +1780,7 @@ mod tests {
                 queue: VecDeque::new(),
                 repl: None,
             };
-            let blocks = build_blocks(None, &messages, &[], Some(&turn), false);
+            let blocks = build_blocks(None, &messages, &[], Some(&turn), false, &test_theme());
             assert!(
                 blocks
                     .iter()
@@ -1708,7 +1792,7 @@ mod tests {
             if let Phase::Running { prompt, .. } = &mut turn.phase {
                 prompt.take();
             }
-            let blocks = build_blocks(None, &messages, &[], Some(&turn), false);
+            let blocks = build_blocks(None, &messages, &[], Some(&turn), false, &test_theme());
             assert!(
                 !blocks
                     .iter()

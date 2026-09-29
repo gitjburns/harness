@@ -85,20 +85,21 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 ## Terminal UI
 
+- Required `[theme]` foreground colors: `system`, `user`, `assistant`, `reasoning`, `tool_call`, `tool_result`, `approval`, `warning`, `error`, `status`, `input`. Every value must be a `#RRGGBB` string; names, missing fields, and unknown keys are startup errors. Colors load at startup with no dimming or background override. Selection remains reverse video.
 - Full screen on the alternate screen, with mouse capture. On exit the terminal returns to its previous contents; nothing is left behind.
 - The transcript always matches what the model sees: every frame draws it from the system message, `messages`, and the turn in progress, so removed or changed messages disappear or change wherever they are. Fields other than content, reasoning, and tool calls are sent but not shown. With tool reasoning on, converted messages are drawn as sent: the generated reasoning-history call and its result, then the message without its reasoning.
-  - System message (if configured): `system` (dim), then the prompt.
-  - User message: `> text`, cyan.
-  - Assistant: reasoning dim, a blank line, then content in the default style. Reasoning is the first non-empty of `reasoning`, `reasoning_content`, and the `text` or `summary` of each `reasoning_details` entry (joined by blank lines).
-  - Tool call: `REPL` (dim), the code, any call notes, then the result, dim. Calls appear once their name and id arrive; the code preview grows as arguments stream in, decoding complete JSON string characters and waiting for incomplete escapes. Malformed arguments are shown raw. Previewing changes neither execution nor interrupted-call persistence. Running REPL print output appears live, in full; host command output is captured until completion.
+  - System message (if configured): `system`, then the prompt, both in `theme.system`.
+  - User message: `> text`, in `theme.user`.
+  - Assistant: reasoning in `theme.reasoning`, a blank line, then content in `theme.assistant`. Reasoning is the first non-empty of `reasoning`, `reasoning_content`, and the `text` or `summary` of each `reasoning_details` entry (joined by blank lines). Converted reasoning history also uses `theme.reasoning`.
+  - Tool call: `REPL` and code in `theme.tool_call`, any call notes, then the result in `theme.tool_result`. Calls appear once their name and id arrive; the code preview grows as arguments stream in, decoding complete JSON string characters and waiting for incomplete escapes. Malformed arguments are shown raw. Previewing changes neither execution nor interrupted-call persistence. Running REPL print output appears live, in full; host command output is captured until completion.
   - A blank line follows each message and each tool call.
-  - Notes are shown but never saved and are lost on exit: verdicts (`safe:` green, `unsafe:` red, `inconclusive:` or `classifier failed:` yellow; `auto` only) under their call, and errors (`error: ...`, red) where they happened. A verdict goes with its call when the call is removed; errors keep their place among the remaining messages.
+  - Notes are shown but never saved and are lost on exit: failure notes use `theme.warning` under their call, and errors (`error: ...`) use `theme.error` where they happened. Call notes disappear when their call is removed; errors keep their place among the remaining messages.
 - Word-wrapped by the app to the screen width and re-wrapped on resize. Rows break after whitespace; longer words break at the width. Tabs expand to 8-column stops; other control characters are not drawn.
 - Scrolling: while at the bottom the view follows new output; scrolled up, it stays on the same text as output arrives or the width changes, until scrolled back to the bottom. Sending a message returns to the bottom.
 - Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
 - Each frame is one synchronized update.
-- Bottom region: a dim top rule, a bright white `> ` prompt followed by the input box (word-wrapped, growing up to half the screen height), and a status line, or the command completion list in its place (see Commands); the region grows to fit the list. A click there only clears the selection.
-- Status line (dim): `<model> | N tokens | <approval_mode>` (tokens: `total_tokens` of the last response that reported usage; omitted until one has), ` | tool reasoning` while it's on, then ` · responding…`, ` · classifying…`, or ` · running…` `(esc to stop)` while busy, ` · allow? (y/n, esc to stop)` in yellow at a prompt, ` · scrolled up (PgDn)` while scrolled up, and ` · <notice>` in yellow until the next key press.
+- Bottom region: a top rule in `theme.status`, a `> ` prompt and input text in `theme.input` (word-wrapped, growing up to half the screen height), and a status line, or the command completion list in its place (see Commands); the region grows to fit the list. Completion labels use `theme.status`, with the selected row reversed. A click there only clears the selection.
+- Status line uses `theme.status`, approval prompts/descriptions use `theme.approval`, and notices use `theme.warning`. The sandbox status fields are specified in `SPEC-sandbox.md`.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
 ## Keys

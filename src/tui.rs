@@ -23,11 +23,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block as Border, Borders, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
 
+use crate::config::Theme;
 use crate::transcript::{Block, View};
 
 /// Prompt marker at the start of the input box.
@@ -85,13 +85,22 @@ impl Tui {
         view: &mut View,
         textarea: &TextArea,
         footer: &[Line],
+        theme: &Theme,
     ) -> io::Result<()> {
         queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
         let drawn = self
             .terminal
             .draw(|frame| {
                 let area = frame.area();
-                render(frame.buffer_mut(), area, blocks, view, textarea, footer);
+                render(
+                    frame.buffer_mut(),
+                    area,
+                    blocks,
+                    view,
+                    textarea,
+                    footer,
+                    theme,
+                );
             })
             .map(|_| ());
         let out = self.terminal.backend_mut();
@@ -127,6 +136,7 @@ fn render(
     view: &mut View,
     textarea: &TextArea,
     footer: &[Line],
+    theme: &Theme,
 ) {
     let (width, height) = (area.width, area.height);
     if width == 0 || height == 0 {
@@ -148,12 +158,11 @@ fn render(
 
     Border::default()
         .borders(Borders::TOP)
-        .border_style(dim())
+        .border_style(theme.status)
         .render(Rect::new(0, region_top, width, 1), buf);
     let text_rows = region_height.saturating_sub(1 + footer_rows);
     if text_rows > 0 {
-        // ratatui's `White` is bright white (SGR 97); `Gray` is the normal one.
-        buf.set_string(0, region_top + 1, PROMPT, Style::default().white());
+        buf.set_string(0, region_top + 1, PROMPT, theme.input);
         textarea.render(
             Rect::new(text_x, region_top + 1, text_width, text_rows),
             buf,
@@ -205,7 +214,36 @@ fn wrapped_rows(textarea: &TextArea, width: u16) -> u16 {
     (probe.screen_cursor().row + 1) as u16
 }
 
-/// Style for the input region's chrome.
-pub fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Input glyphs, its prompt, and the separator use explicit colors without dimming.
+    #[test]
+    fn input_and_chrome_use_theme() {
+        let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        let theme: Theme = config["theme"].clone().try_into().unwrap();
+        let mut textarea = crate::input::new_textarea(&theme);
+        textarea.insert_str("abc");
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = Buffer::empty(area);
+        render(
+            &mut buffer,
+            area,
+            &[],
+            &mut View::default(),
+            &textarea,
+            &[Line::styled("status", theme.status)],
+            &theme,
+        );
+        assert_eq!(buffer[(0, 8)].fg, theme.input.fg.unwrap());
+        assert_eq!(buffer[(2, 8)].fg, theme.input.fg.unwrap());
+        assert_eq!(buffer[(0, 7)].fg, theme.status.fg.unwrap());
+        assert_eq!(buffer[(0, 9)].fg, theme.status.fg.unwrap());
+        assert!(
+            !buffer[(2, 8)]
+                .modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+    }
 }
