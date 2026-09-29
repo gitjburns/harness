@@ -26,6 +26,14 @@ ${command}"""
 base_url = "http://127.0.0.1:8000/v1"
 model = "your-description-model"
 
+# [approval_description.endpoint.parameters]
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 40
+# presence_penalty = 0.5
+# repetition_penalty = 1.1
+# max_tokens = 8192
+
 # System prompt
 #
 [chat]
