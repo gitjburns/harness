@@ -27,6 +27,8 @@ struct Endpoint {
     /// Name of the environment variable holding the API key. Omitted means the
     /// request is sent without an `Authorization` header.
     api_key_env: Option<String>,
+    /// Optional request fields; omission sends no parameter overrides.
+    parameters: Option<toml::Table>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +103,8 @@ pub struct ResolvedEndpoint {
     pub url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// JSON-compatible request fields, validated against protocol-owned keys.
+    pub parameters: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct Settings {
@@ -131,6 +135,8 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         .with_context(|| format!("reading {}", config_path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
+    let parameters = endpoint_parameters(config.endpoint.parameters.as_ref())
+        .with_context(|| format!("parsing {}", config_path.display()))?;
 
     // Command execution must use the configured executable, never resolve an allow
     // entry relative to the repository or through PATH.
@@ -180,6 +186,7 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
             ),
             model: endpoint.model,
             api_key,
+            parameters,
         },
         chat_prompt: config.chat.prompt,
         tool_reasoning: config.chat.tool_reasoning,
@@ -188,6 +195,63 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         max_memory_mb: config.repl.max_memory_mb,
         commands: config.commands,
         output_limit: config.repl.output_limit,
+    })
+}
+
+/// Reserve protocol-owned fields while leaving endpoint-specific names to the server.
+fn endpoint_parameters(
+    table: Option<&toml::Table>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut parameters = serde_json::Map::new();
+    if let Some(table) = table {
+        for (name, value) in table {
+            if matches!(
+                name.as_str(),
+                "model" | "messages" | "tools" | "stream" | "stream_options" | "n"
+            ) {
+                bail!("endpoint.parameters.{name} is reserved by Harness");
+            }
+            parameters.insert(
+                name.clone(),
+                json_parameter(value, &format!("endpoint.parameters.{name}"))?,
+            );
+        }
+    }
+    Ok(parameters)
+}
+
+/// Convert without silently turning non-finite numbers into null or dates into objects.
+fn json_parameter(value: &toml::Value, key: &str) -> anyhow::Result<serde_json::Value> {
+    use serde_json::Value;
+    Ok(match value {
+        toml::Value::String(value) => Value::String(value.clone()),
+        toml::Value::Integer(value) => Value::from(*value),
+        toml::Value::Float(value) => Value::Number(
+            serde_json::Number::from_f64(*value)
+                .with_context(|| format!("{key}: non-finite numbers cannot be sent as JSON"))?,
+        ),
+        toml::Value::Boolean(value) => Value::Bool(*value),
+        toml::Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| json_parameter(value, &format!("{key}[{index}]")))
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        toml::Value::Table(values) => Value::Object(
+            values
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        json_parameter(value, &format!("{key}.{name}"))?,
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?,
+        ),
+        toml::Value::Datetime(_) => {
+            bail!("{key}: TOML dates and times cannot be sent as JSON; use a quoted string")
+        }
     })
 }
 
@@ -241,4 +305,67 @@ fn save_setting(dir: &Path, table: &str, key: &str, new: toml_edit::Value) -> an
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &config_path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), config_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Omission adds no defaults; configured scalar and structured values retain their types.
+    #[test]
+    fn endpoint_parameters_preserve_values() {
+        assert!(endpoint_parameters(None).unwrap().is_empty());
+        let table = toml::from_str("temperature = 0.7\ntop_p = 0.9\ntop_k = 40\npresence_penalty = 0.5\nrepetition_penalty = 1.1\nmax_tokens = 8192\nstop = ['END']\ncustom = { enabled = true }\n").unwrap();
+        assert_eq!(
+            serde_json::Value::Object(endpoint_parameters(Some(&table)).unwrap()),
+            serde_json::json!({
+                "temperature": 0.7, "top_p": 0.9, "top_k": 40, "presence_penalty": 0.5,
+                "repetition_penalty": 1.1, "max_tokens": 8192, "stop": ["END"], "custom": {"enabled": true}
+            })
+        );
+    }
+
+    /// Protocol fields must fail explicitly rather than override the client's required fields.
+    #[test]
+    fn endpoint_parameters_reject_reserved_fields() {
+        for name in [
+            "model",
+            "messages",
+            "tools",
+            "stream",
+            "stream_options",
+            "n",
+        ] {
+            let table = toml::from_str(&format!("{name} = 1")).unwrap();
+            assert_eq!(
+                endpoint_parameters(Some(&table)).unwrap_err().to_string(),
+                format!("endpoint.parameters.{name} is reserved by Harness")
+            );
+        }
+    }
+
+    /// Nested invalid values must fail with their full location, never become JSON null.
+    #[test]
+    fn endpoint_parameters_reject_non_json_values() {
+        for (source, expected) in [
+            (
+                "temperature = nan",
+                "endpoint.parameters.temperature: non-finite numbers cannot be sent as JSON",
+            ),
+            (
+                "custom = { values = [inf] }",
+                "endpoint.parameters.custom.values[0]: non-finite numbers cannot be sent as JSON",
+            ),
+            (
+                "custom = { date = 2026-09-28 }",
+                "endpoint.parameters.custom.date: TOML dates and times cannot be sent as JSON; use a quoted string",
+            ),
+        ] {
+            let table = toml::from_str(source).unwrap();
+            assert_eq!(
+                endpoint_parameters(Some(&table)).unwrap_err().to_string(),
+                expected
+            );
+        }
+    }
 }

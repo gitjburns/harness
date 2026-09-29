@@ -8,6 +8,14 @@ model = "DeepSeek-V4-Flash-0731"
 #
 #api_key_env = "API_KEY"
 
+# [endpoint.parameters]
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 40
+# presence_penalty = 0.5
+# repetition_penalty = 1.1
+# max_tokens = 8192
+
 # System prompt
 #
 [chat]

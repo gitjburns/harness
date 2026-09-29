@@ -59,13 +59,18 @@ pub fn start(
         .into_iter()
         .chain(messages)
         .collect();
-    let body = json!({
+    let mut body = json!({
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
         "tools": [repl_tool(tool_description)],
         "messages": messages,
     });
+    // Config validation reserves the fields above; server-specific parameters
+    // are forwarded at the top level without supplying sampling defaults.
+    body.as_object_mut()
+        .expect("request body is an object")
+        .extend(endpoint.parameters.clone());
     let request = post(http, endpoint, &body);
 
     let (tx, rx) = mpsc::unbounded_channel();

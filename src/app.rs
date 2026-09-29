@@ -1052,7 +1052,6 @@ fn build_blocks<'a>(
 
     // Keyed as the message it will be saved as, so saving it changes no keys.
     if let Some(Phase::Streaming(reply)) = phase {
-        // Tool calls aren't drawn while streaming; they appear once the reply is saved.
         let part = |n| Key::Message(messages.len(), n);
         let reasoning = reasoning_text(&reply.fields);
         let has_reasoning = reasoning.is_some();
@@ -1065,6 +1064,45 @@ fn build_blocks<'a>(
                 blocks.push(blank(part(1)));
             }
             blocks.push(Block::new(part(2), content, plain()));
+        }
+        if has_reasoning || content.is_some_and(|content| !content.is_empty()) {
+            blocks.push(blank(part(3)));
+        }
+        for call in reply
+            .fields
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let Some(name) = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let arguments = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Reuse the completed call's keys; previews never enter execution or persistence.
+            let part = |n| Key::Call(id.to_owned(), n);
+            blocks.push(Block::new(part(0), name, tui::dim()));
+            let code = if name == "REPL" {
+                streamed_code(arguments)
+            } else {
+                arguments.to_owned()
+            };
+            blocks.push(Block::new(part(1), code, plain()));
+            blocks.push(blank(part(3)));
         }
     }
     blocks
@@ -1105,6 +1143,128 @@ fn is_exempt(code: &str) -> bool {
         .filter(|s| !s.is_empty())
         .peekable();
     statements.peek().is_some() && statements.all(|s| matches!(s, "FYI()" | "help()"))
+}
+
+/// Display the code available so far without accepting incomplete JSON for execution.
+fn streamed_code(arguments: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(arguments);
+    if let Ok(value) = &parsed {
+        return value["code"].as_str().unwrap_or(arguments).to_owned();
+    }
+    // Walk only top-level object fields, so nested or quoted "code" text cannot
+    // masquerade as the REPL argument. Complete preceding values use serde's parser.
+    let preview = || -> Option<String> {
+        let mut rest = arguments.trim_start().strip_prefix('{')?.trim_start();
+        loop {
+            if rest.is_empty() {
+                return Some(String::new());
+            }
+            let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            let key = match keys.next()? {
+                Ok(key) => key,
+                Err(error) if error.is_eof() => return Some(String::new()),
+                Err(_) => return None,
+            };
+            rest = rest[keys.byte_offset()..].trim_start();
+            if rest.is_empty() {
+                return Some(String::new());
+            }
+            rest = rest.strip_prefix(':')?.trim_start();
+            if rest.is_empty() {
+                return Some(String::new());
+            }
+            if key == "code" {
+                let (code, closed) = streamed_string(rest)?;
+                // A complete string in malformed JSON must remain visibly malformed.
+                if closed && !parsed.as_ref().unwrap_err().is_eof() {
+                    return None;
+                }
+                return Some(code);
+            }
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+            match values.next()? {
+                Ok(_) => {}
+                Err(error) if error.is_eof() => return Some(String::new()),
+                Err(_) => return None,
+            }
+            rest = rest[values.byte_offset()..].trim_start();
+            if rest.is_empty() {
+                return Some(String::new());
+            }
+            rest = rest.strip_prefix(',')?.trim_start();
+        }
+    };
+    preview().unwrap_or_else(|| arguments.to_owned())
+}
+
+/// Decode complete characters only; partial escapes and surrogate pairs wait for more data.
+fn streamed_string(source: &str) -> Option<(String, bool)> {
+    let mut chars = source.strip_prefix('"')?.chars();
+    let mut output = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some((output, true)),
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    break;
+                };
+                let decoded = match escape {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => {
+                        let Some(high) = streamed_hex(&mut chars)? else {
+                            break;
+                        };
+                        if (0xd800..=0xdbff).contains(&high) {
+                            // A high surrogate is one character only with its complete low half.
+                            match chars.next() {
+                                None => break,
+                                Some('\\') => {}
+                                _ => return None,
+                            }
+                            match chars.next() {
+                                None => break,
+                                Some('u') => {}
+                                _ => return None,
+                            }
+                            let Some(low) = streamed_hex(&mut chars)? else {
+                                break;
+                            };
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return None;
+                            }
+                            char::from_u32(0x10000 + ((high - 0xd800) << 10) + low - 0xdc00)?
+                        } else {
+                            char::from_u32(high)?
+                        }
+                    }
+                    _ => return None,
+                };
+                output.push(decoded);
+            }
+            ch if ch < '\u{20}' => return None,
+            ch => output.push(ch),
+        }
+    }
+    Some((output, false))
+}
+
+/// Distinguish an unfinished Unicode escape from an invalid hexadecimal digit.
+fn streamed_hex(chars: &mut std::str::Chars<'_>) -> Option<Option<u32>> {
+    let mut value = 0;
+    for _ in 0..4 {
+        let Some(ch) = chars.next() else {
+            return Some(None);
+        };
+        value = value * 16 + ch.to_digit(16)?;
+    }
+    Some(Some(value))
 }
 
 /// The `code` argument of a REPL call, or the error to return to the model.
@@ -1213,4 +1373,125 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every fragment boundary must display only a decoded prefix, including split escapes.
+    #[test]
+    fn tool_code_preview_handles_fragment_boundaries() {
+        for arguments in [
+            r#"{"code":"print(\"hi\")\npath = 'a\\b'\t# café"}"#,
+            r#"{"code":"a\u00e9\ud83d\ude42b"}"#,
+            r#"{"other":{"code":"wrong"},"co\u0064e":"right\ncode"}"#,
+        ] {
+            let expected: Value = serde_json::from_str(arguments).unwrap();
+            let expected = expected["code"].as_str().unwrap();
+            let mut previous = String::new();
+            for end in 0..=arguments.len() {
+                if !arguments.is_char_boundary(end) {
+                    continue;
+                }
+                let preview = streamed_code(&arguments[..end]);
+                assert!(
+                    expected.starts_with(&preview),
+                    "unexpected preview {preview:?} at {end}: {arguments}"
+                );
+                assert!(
+                    preview.starts_with(&previous),
+                    "preview regressed at {end}: {arguments}"
+                );
+                previous = preview;
+            }
+            assert_eq!(previous, expected);
+        }
+    }
+
+    /// Malformed input stays visible, and a readable preview never makes a call executable.
+    #[test]
+    fn tool_code_preview_preserves_invalid_arguments() {
+        for arguments in [
+            r#"{"code":12}"#,
+            r#"{"code":"bad\q"#,
+            r#"{"code":"bad\udc00"#,
+            r#"{"code":"ok",!"#,
+            r#"{"other":"only"}"#,
+        ] {
+            assert_eq!(streamed_code(arguments), arguments);
+        }
+        let call = ToolCall {
+            id: "partial".into(),
+            kind: "function".into(),
+            extra: Map::new(),
+            function: FunctionCall {
+                name: "REPL".into(),
+                arguments: r#"{"code":"print(1)"#.into(),
+                extra: Map::new(),
+            },
+        };
+        assert_eq!(streamed_code(&call.function.arguments), "print(1)");
+        assert!(code_of(&call).is_err());
+    }
+
+    /// Real delta accumulation keeps multiple previews distinct and matches completed-call keys.
+    #[tokio::test]
+    async fn tool_call_previews_match_completed_blocks() {
+        let mut fields = Map::new();
+        for delta in [
+            serde_json::json!({"tool_calls":[{"index":0,"function":{"name":"REPL","arguments":"{\"code\":\"print("}}]}),
+            serde_json::json!({"tool_calls":[{"index":1,"id":"second","type":"function","function":{"name":"REPL","arguments":"{\"code\":\"x = 2"}}]}),
+            serde_json::json!({"tool_calls":[{"index":0,"id":"first","type":"function","function":{"arguments":"1)\"}"}},{"index":1,"function":{"arguments":"\"}"}}]}),
+        ] {
+            client::accumulate(&mut fields, delta.as_object().unwrap().clone());
+        }
+        let (_, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(std::future::pending());
+        let turn = Turn {
+            phase: Phase::Streaming(Reply {
+                task,
+                events,
+                fields,
+            }),
+            queue: VecDeque::new(),
+            repl: None,
+        };
+        let streamed = build_blocks(None, &[], &[], Some(&turn), false);
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|block| block.text.as_ref())
+                .collect::<Vec<_>>(),
+            ["REPL", "print(1)", "", "REPL", "x = 2", ""]
+        );
+        assert!(streamed[1].key == Key::Call("first".into(), 1));
+        assert!(streamed[4].key == Key::Call("second".into(), 1));
+        let Phase::Streaming(reply) = &turn.phase else {
+            unreachable!()
+        };
+        let calls = reply.fields["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                let mut value = value.clone();
+                value.as_object_mut().unwrap().remove("index");
+                serde_json::from_value(value).unwrap()
+            })
+            .collect();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            tool_calls: Some(calls),
+            ..Message::default()
+        }];
+        let completed = build_blocks(None, &messages, &[], None, false);
+        assert!(
+            streamed
+                .iter()
+                .map(|block| (&block.key, &block.text))
+                .eq(completed.iter().map(|block| (&block.key, &block.text)))
+        );
+        reply.task.abort();
+    }
 }

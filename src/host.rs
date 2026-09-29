@@ -201,17 +201,25 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
     text.push_str(STUBS.trim());
     text.push_str("\nrun: executes a command name directly; returns exit_code, stdout, stderr.\nlib_source: reads replib/<name>.py.\n");
     text.push_str("\nLibrary functions:\n");
+    // Explicit empty states distinguish complete listings from truncated output.
+    if host.library.is_empty() {
+        text.push_str("No library functions loaded.\n");
+    }
     for (name, function) in &host.library {
         text.push_str(&format!(
             "{name}{}\n{}\n",
             function.signature, function.docstring
         ));
     }
-    text.push_str("\nAllowed command names (deny takes precedence):\n");
+    text.push_str("\nCommands configured to run without approval (deny takes precedence):\n");
+    if host.config.allow.is_empty() {
+        text.push_str("(none)\n");
+    }
     for name in host.config.allow.keys() {
         text.push_str(name);
         text.push('\n');
     }
+    text.push_str("\nOther commands found on PATH require approval unless denied.\n");
     host.output(text);
     Ok(MontyObject::none())
 }

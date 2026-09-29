@@ -44,6 +44,20 @@ env_filter = ["GITHUB_TOKEN"]    # exact names removed from command environments
 
 These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[commands.allow]` even when empty. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. See `config.toml.example` for a complete example.
 
+Optional `[endpoint.parameters]` entries are sent as top-level request fields. Uncomment the table heading and desired values in `config.toml` to enable overrides:
+
+```toml
+# [endpoint.parameters]
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 40
+# presence_penalty = 0.5
+# repetition_penalty = 1.1
+# max_tokens = 8192
+```
+
+Omitted parameters use endpoint defaults. The endpoint validates parameter names and ranges. Harness rejects reserved keys (`model`, `messages`, `tools`, `stream`, `stream_options`, `n`), non-finite numbers, and unquoted TOML dates/times. Strings, numbers, booleans, arrays, and nested tables are supported.
+
 If the endpoint needs a key, put it in `~/.harness/.env` (and keep that file out of version control):
 
 ```
@@ -77,7 +91,7 @@ This also works with `--resume <NAME>`. The text is used verbatim, including an 
 
 Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: the model's reasoning appears dimmed, followed by the answer.
 
-When the model uses the REPL, you see the code and its printed output as it runs. Host commands return captured output when they finish. The model keeps calling the REPL until it answers without one. Esc stops it at any point.
+When the model uses the REPL, its code appears as the tool-call arguments stream in. Execution waits for the complete response; printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling the REPL until it answers without one. Esc stops it at any point.
 
 The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals show the operation in yellow; press `y` to allow or `n` to deny.
 
