@@ -101,6 +101,14 @@ While the model is working, you can keep typing your next message. It sends once
 
 **Approval exemptions.** All synthetic tool calls, including `FYI()` and `help()` and any added in the future, never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules.
 
+### Approval descriptions
+
+Set `[approval_description] enabled = true` to request a concise explanation alongside each approval. Its `prompt` must contain `${command}`, replaced with the pending operation as JSON: the resolved executable, arguments, and working directory, or the directory being approved. Enclosing REPL code and chat history are not sent.
+
+`[approval_description.endpoint]` has its own `base_url`, `model`, optional `api_key_env`, and optional `parameters` table. See `config.toml.example` for the complete configuration. An absent section or `enabled = false` disables descriptions; enabling requires both the prompt and endpoint.
+
+While the request runs, `Generating description…` appears beneath the original call. You can press `y`, `n`, or Esc immediately. Resolving the approval cancels unfinished generation and removes the description. Request failures appear as `Description unavailable: …`; approval remains available. Descriptions are never saved in the session or sent to the chat model.
+
 ### Filesystem permissions
 
 Shift+Tab cycles `none → read-only → read-write`; the choice is saved to `config.toml` and applies to the next filesystem operation, including during a call.

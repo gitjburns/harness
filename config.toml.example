@@ -16,6 +16,16 @@ model = "DeepSeek-V4-Flash-0731"
 # repetition_penalty = 1.1
 # max_tokens = 8192
 
+[approval_description]
+enabled = false
+prompt = """Provide a 1 to 2 sentence description of what the following command or code does:
+
+${command}"""
+
+[approval_description.endpoint]
+base_url = "http://127.0.0.1:8000/v1"
+model = "your-description-model"
+
 # System prompt
 #
 [chat]

@@ -16,6 +16,7 @@ struct Config {
     chat: Chat,
     repl: Repl,
     commands: Commands,
+    approval_description: Option<ApprovalDescription>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +30,14 @@ struct Endpoint {
     api_key_env: Option<String>,
     /// Optional request fields; omission sends no parameter overrides.
     parameters: Option<toml::Table>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalDescription {
+    enabled: bool,
+    prompt: Option<String>,
+    endpoint: Option<Endpoint>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +116,13 @@ pub struct ResolvedEndpoint {
     pub parameters: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Independent endpoint and template for display-only explanations of pending operations.
+#[derive(Clone)]
+pub struct ApprovalDescriptionSettings {
+    pub endpoint: ResolvedEndpoint,
+    pub prompt: String,
+}
+
 pub struct Settings {
     /// The harness directory the settings were loaded from (`harness_dir`).
     pub dir: PathBuf,
@@ -118,6 +134,7 @@ pub struct Settings {
     pub max_memory_mb: usize,
     pub commands: Commands,
     pub output_limit: usize,
+    pub approval_description: Option<ApprovalDescriptionSettings>,
 }
 
 /// `~/.harness`: config, `.env`, sessions, and `replib/`, shared by every directory the
@@ -135,8 +152,6 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         .with_context(|| format!("reading {}", config_path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
-    let parameters = endpoint_parameters(config.endpoint.parameters.as_ref())
-        .with_context(|| format!("parsing {}", config_path.display()))?;
 
     // Command execution must use the configured executable, never resolve an allow
     // entry relative to the repository or through PATH.
@@ -163,31 +178,24 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         }
     }
 
-    let endpoint = config.endpoint;
-    let api_key = match &endpoint.api_key_env {
-        // Variables already set in the shell take precedence over `.env`.
-        Some(name) => match std::env::var(name).ok().or_else(|| dotenv.remove(name)) {
-            Some(key) => Some(key),
-            None => bail!(
-                "{}: api_key_env names {name}, which is not set in the environment or {}",
-                config_path.display(),
-                env_path.display()
-            ),
-        },
-        None => None,
-    };
+    let endpoint = resolve_endpoint(
+        config.endpoint,
+        "endpoint",
+        &dotenv,
+        &config_path,
+        &env_path,
+    )?;
+    let approval_description = resolve_approval_description(
+        config.approval_description,
+        &dotenv,
+        &config_path,
+        &env_path,
+    )?;
 
     Ok(Settings {
         dir: dir.to_path_buf(),
-        endpoint: ResolvedEndpoint {
-            url: format!(
-                "{}/chat/completions",
-                endpoint.base_url.trim_end_matches('/')
-            ),
-            model: endpoint.model,
-            api_key,
-            parameters,
-        },
+        endpoint,
+        approval_description,
         chat_prompt: config.chat.prompt,
         tool_reasoning: config.chat.tool_reasoning,
         repl_tool_description: config.repl.tool_description,
@@ -198,9 +206,84 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
     })
 }
 
+/// Resolve either endpoint without consuming credentials shared by both configurations.
+fn resolve_endpoint(
+    endpoint: Endpoint,
+    field: &str,
+    dotenv: &HashMap<String, String>,
+    config_path: &Path,
+    env_path: &Path,
+) -> anyhow::Result<ResolvedEndpoint> {
+    let parameters = endpoint_parameters(endpoint.parameters.as_ref(), field)
+        .with_context(|| format!("parsing {}", config_path.display()))?;
+    let api_key = match &endpoint.api_key_env {
+        // Variables already set in the shell take precedence over `.env`.
+        Some(name) => match std::env::var(name)
+            .ok()
+            .or_else(|| dotenv.get(name).cloned())
+        {
+            Some(key) => Some(key),
+            None => bail!(
+                "{}: {field}.api_key_env names {name}, which is not set in the environment or {}",
+                config_path.display(),
+                env_path.display()
+            ),
+        },
+        None => None,
+    };
+    Ok(ResolvedEndpoint {
+        url: format!(
+            "{}/chat/completions",
+            endpoint.base_url.trim_end_matches('/')
+        ),
+        model: endpoint.model,
+        api_key,
+        parameters,
+    })
+}
+
+/// An enabled feature requires its own endpoint and an operation-bearing prompt.
+fn resolve_approval_description(
+    config: Option<ApprovalDescription>,
+    dotenv: &HashMap<String, String>,
+    config_path: &Path,
+    env_path: &Path,
+) -> anyhow::Result<Option<ApprovalDescriptionSettings>> {
+    let Some(config) = config.filter(|config| config.enabled) else {
+        return Ok(None);
+    };
+    let prompt = config.prompt.with_context(|| {
+        format!(
+            "{}: approval_description.prompt is required when enabled",
+            config_path.display()
+        )
+    })?;
+    if !prompt.contains("${command}") {
+        bail!(
+            "{}: approval_description.prompt must contain ${{command}}",
+            config_path.display()
+        );
+    }
+    let endpoint = config.endpoint.with_context(|| {
+        format!(
+            "{}: approval_description.endpoint is required when enabled",
+            config_path.display()
+        )
+    })?;
+    let endpoint = resolve_endpoint(
+        endpoint,
+        "approval_description.endpoint",
+        dotenv,
+        config_path,
+        env_path,
+    )?;
+    Ok(Some(ApprovalDescriptionSettings { endpoint, prompt }))
+}
+
 /// Reserve protocol-owned fields while leaving endpoint-specific names to the server.
 fn endpoint_parameters(
     table: Option<&toml::Table>,
+    field: &str,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let mut parameters = serde_json::Map::new();
     if let Some(table) = table {
@@ -209,11 +292,11 @@ fn endpoint_parameters(
                 name.as_str(),
                 "model" | "messages" | "tools" | "stream" | "stream_options" | "n"
             ) {
-                bail!("endpoint.parameters.{name} is reserved by Harness");
+                bail!("{field}.parameters.{name} is reserved by Harness");
             }
             parameters.insert(
                 name.clone(),
-                json_parameter(value, &format!("endpoint.parameters.{name}"))?,
+                json_parameter(value, &format!("{field}.parameters.{name}"))?,
             );
         }
     }
@@ -314,10 +397,10 @@ mod tests {
     /// Omission adds no defaults; configured scalar and structured values retain their types.
     #[test]
     fn endpoint_parameters_preserve_values() {
-        assert!(endpoint_parameters(None).unwrap().is_empty());
+        assert!(endpoint_parameters(None, "endpoint").unwrap().is_empty());
         let table = toml::from_str("temperature = 0.7\ntop_p = 0.9\ntop_k = 40\npresence_penalty = 0.5\nrepetition_penalty = 1.1\nmax_tokens = 8192\nstop = ['END']\ncustom = { enabled = true }\n").unwrap();
         assert_eq!(
-            serde_json::Value::Object(endpoint_parameters(Some(&table)).unwrap()),
+            serde_json::Value::Object(endpoint_parameters(Some(&table), "endpoint").unwrap()),
             serde_json::json!({
                 "temperature": 0.7, "top_p": 0.9, "top_k": 40, "presence_penalty": 0.5,
                 "repetition_penalty": 1.1, "max_tokens": 8192, "stop": ["END"], "custom": {"enabled": true}
@@ -338,7 +421,9 @@ mod tests {
         ] {
             let table = toml::from_str(&format!("{name} = 1")).unwrap();
             assert_eq!(
-                endpoint_parameters(Some(&table)).unwrap_err().to_string(),
+                endpoint_parameters(Some(&table), "endpoint")
+                    .unwrap_err()
+                    .to_string(),
                 format!("endpoint.parameters.{name} is reserved by Harness")
             );
         }
@@ -363,9 +448,74 @@ mod tests {
         ] {
             let table = toml::from_str(source).unwrap();
             assert_eq!(
-                endpoint_parameters(Some(&table)).unwrap_err().to_string(),
+                endpoint_parameters(Some(&table), "endpoint")
+                    .unwrap_err()
+                    .to_string(),
                 expected
             );
         }
+    }
+
+    /// Enabled descriptions need explicit configuration; disabled and absent sections need none.
+    #[test]
+    fn approval_description_configuration() {
+        let dotenv = HashMap::new();
+        let resolve = |source: Option<&str>| {
+            resolve_approval_description(
+                source.map(|source| toml::from_str(source).unwrap()),
+                &dotenv,
+                Path::new("config.toml"),
+                Path::new(".env"),
+            )
+        };
+        assert!(resolve(None).unwrap().is_none());
+        assert!(resolve(Some("enabled = false")).unwrap().is_none());
+        for (source, key) in [
+            ("enabled = true", "approval_description.prompt"),
+            ("enabled = true\nprompt = 'Explain this'", "${command}"),
+            (
+                "enabled = true\nprompt = '${command}'",
+                "approval_description.endpoint",
+            ),
+        ] {
+            let error = resolve(Some(source))
+                .err()
+                .expect("invalid config accepted")
+                .to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let resolved = resolve(Some("enabled = true\nprompt = 'Describe ${command}'\n[endpoint]\nbase_url = 'http://description.test/v1/'\nmodel = 'describer'\n[endpoint.parameters]\ntemperature = 0.1")).unwrap().unwrap();
+        assert_eq!(
+            resolved.endpoint.url,
+            "http://description.test/v1/chat/completions"
+        );
+        assert_eq!(resolved.endpoint.model, "describer");
+        assert_eq!(resolved.endpoint.parameters["temperature"], 0.1);
+        let example: Config = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        assert!(!example.approval_description.unwrap().enabled);
+    }
+
+    /// Sharing an API-key name must not consume its private dotenv entry after the first endpoint.
+    #[test]
+    fn endpoints_can_share_dotenv_credentials() {
+        let name = "HARNESS_DESCRIPTION_TEST_CREDENTIAL_7813";
+        assert!(std::env::var_os(name).is_none());
+        let dotenv = HashMap::from([(name.to_owned(), "test-value".to_owned())]);
+        for field in ["endpoint", "approval_description.endpoint"] {
+            let endpoint: Endpoint = toml::from_str(&format!(
+                "base_url = 'http://example.test'\nmodel = 'test'\napi_key_env = '{name}'"
+            ))
+            .unwrap();
+            let resolved = resolve_endpoint(
+                endpoint,
+                field,
+                &dotenv,
+                Path::new("config.toml"),
+                Path::new(".env"),
+            )
+            .unwrap();
+            assert_eq!(resolved.api_key.as_deref(), Some("test-value"));
+        }
+        assert_eq!(dotenv.len(), 1);
     }
 }

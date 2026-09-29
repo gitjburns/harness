@@ -24,6 +24,8 @@ cargo = "/Users/me/.cargo/bin/cargo"
 
 `tool_description`, `permission`, and `max_memory_mb` are required; omission is a startup error. `tool_description` is loaded at startup and used verbatim in every REPL tool definition. The values above are examples, not runtime defaults. An `allow` value that isn't an absolute path is a config error. A name in both `deny` and `allow` is denied.
 
+Optional `[approval_description]`: required `enabled` boolean; when true, require a `prompt` containing `${command}` and `[approval_description.endpoint]` with `base_url`, `model`, optional `api_key_env`, and optional `parameters` as for the chat endpoint. An absent section or false toggle disables requests. Endpoints resolve credentials independently, including shared `.env` key names.
+
 ## REPL
 
 - Monty worker: the harness binary run as a hidden worker subcommand (`monty_proto::worker::Child` over stdio, `monty_alloc::LimitedAllocator` as global allocator), launched via `current_exe()` by a `monty_pool::Pool` with one idle worker and at most one worker.
@@ -78,6 +80,8 @@ Every file operation reaches the app as an OS call and is checked before it is s
 
 - Status line: `<model> | N tokens | <permission>`, ` | tool reasoning` while on; activity as before without ` · classifying…`.
 - Prompts show in the status line in yellow: `allow <operation>? (y/n, esc to stop)`.
+- Enabled approval descriptions issue one independent, non-streaming chat-completions request with the substituted template as its sole user message and no tools or chat history. `${command}` is JSON describing only the pending operation: resolved executable, arguments, and working directory for command execution; the resolved directory for a directory approval.
+- The original call stays visible. A wrapped, display-only block beneath it shows `Generating description…`, then `Description: <text>` or `Description unavailable: <error>`. Approval keys remain active throughout. Resolving or abandoning the approval removes the block and cancels pending generation; results cannot attach to another approval. Descriptions are not saved or sent to the chat model.
 - Shift+Tab cycles `none → read-only → read-write`, saved to `[repl] permission`.
 
 ## Removed

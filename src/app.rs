@@ -129,6 +129,57 @@ enum Phase {
 struct PendingPrompt {
     operation: String,
     answer: oneshot::Sender<bool>,
+    description: Option<ApprovalDescription>,
+}
+
+impl PendingPrompt {
+    /// Cancel explanation work before allowing the suspended host operation to resume.
+    fn respond(self, allow: bool) -> anyhow::Result<()> {
+        drop(self.description);
+        self.answer
+            .send(allow)
+            .map_err(|_| anyhow::anyhow!("couldn't answer approval: the REPL stopped waiting"))
+    }
+}
+
+/// Owned by one approval, so resolving or abandoning it cannot update a later prompt.
+struct ApprovalDescription {
+    task: Option<JoinHandle<anyhow::Result<String>>>,
+    text: String,
+}
+
+impl ApprovalDescription {
+    /// Begin independently of the REPL driver; the approval answer stays immediately usable.
+    fn start(
+        http: reqwest::Client,
+        settings: config::ApprovalDescriptionSettings,
+        input: String,
+    ) -> Self {
+        Self {
+            task: Some(tokio::spawn(async move {
+                client::describe_approval(&http, &settings, &input).await
+            })),
+            text: "Generating description…".into(),
+        }
+    }
+
+    /// Consume the completed request once; errors stay visible without blocking approval.
+    fn complete(&mut self, result: anyhow::Result<String>) {
+        self.task = None;
+        self.text = match result {
+            Ok(text) => format!("Description: {text}"),
+            Err(error) => format!("Description unavailable: {error:#}"),
+        };
+    }
+}
+
+impl Drop for ApprovalDescription {
+    /// Dropping a JoinHandle alone detaches its task, so explicitly cancel pending HTTP work.
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 struct PendingCall {
@@ -171,6 +222,7 @@ enum TurnEvent {
     Stream(StreamEvent),
     Finished(anyhow::Result<()>),
     Repl(anyhow::Result<ReplEvent>),
+    Description(anyhow::Result<String>),
 }
 
 enum Flow {
@@ -233,6 +285,20 @@ impl App {
                     result.context("ending REPL session")?;
                 }
                 Step::Turn(TurnEvent::Repl(event)) => self.on_repl(event)?,
+                Step::Turn(TurnEvent::Description(result)) => {
+                    if let Some(Turn {
+                        phase:
+                            Phase::Running {
+                                prompt: Some(prompt),
+                                ..
+                            },
+                        ..
+                    }) = &mut self.turn
+                        && let Some(description) = &mut prompt.description
+                    {
+                        description.complete(result);
+                    }
+                }
             }
             self.advance().await?;
         }
@@ -434,9 +500,7 @@ impl App {
             return Ok(());
         };
         if let Some(prompt) = prompt.take() {
-            prompt.answer.send(allow).map_err(|_| {
-                anyhow::anyhow!("couldn't answer approval: the REPL stopped waiting")
-            })?;
+            prompt.respond(allow)?;
         }
         Ok(())
     }
@@ -485,9 +549,24 @@ impl App {
                 output.push_str(&text);
                 return Ok(());
             }
-            Ok(ReplEvent::Prompt { operation, answer }) => {
+            Ok(ReplEvent::Prompt {
+                operation,
+                description_input,
+                answer,
+            }) => {
                 anyhow::ensure!(prompt.is_none(), "REPL requested overlapping approvals");
-                *prompt = Some(PendingPrompt { operation, answer });
+                let description = self.settings.approval_description.as_ref().map(|settings| {
+                    ApprovalDescription::start(
+                        self.http.clone(),
+                        settings.clone(),
+                        description_input,
+                    )
+                });
+                *prompt = Some(PendingPrompt {
+                    operation,
+                    answer,
+                    description,
+                });
                 return Ok(());
             }
             Ok(ReplEvent::Failure {
@@ -972,7 +1051,11 @@ fn build_blocks<'a>(
         }
     };
     let (phase, running) = match turn.map(|t| &t.phase) {
-        Some(Phase::Running { call, output, .. }) => (None, Some((&call.call.id, output))),
+        Some(Phase::Running {
+            call,
+            output,
+            prompt,
+        }) => (None, Some((&call.call.id, output, prompt.as_ref()))),
         phase => (phase, None),
     };
 
@@ -1034,9 +1117,20 @@ fn build_blocks<'a>(
                         let key = part(4 + n as u8);
                         blocks.push(Block::new(key, note.text.as_str(), note.style));
                     }
+                    if let Some((id, _, Some(prompt))) = running
+                        && *id == call.id
+                        && let Some(description) = &prompt.description
+                    {
+                        // This wraps with the transcript and disappears with the pending approval.
+                        blocks.push(Block::new(
+                            Key::ApprovalDescription(call.id.clone()),
+                            description.text.as_str(),
+                            Style::default().yellow(),
+                        ));
+                    }
                     if let Some(result) = results.get(call.id.as_str()) {
                         blocks.push(Block::new(part(2), *result, tool_output_style()));
-                    } else if let Some((id, output)) = running
+                    } else if let Some((id, output, _)) = running
                         && *id == call.id
                         && !output.is_empty()
                     {
@@ -1340,12 +1434,27 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
             Ok(result) => result,
             Err(error) => Err(error.into()),
         }),
-        Phase::Running { .. } => match turn.repl.as_mut() {
-            Some(repl) => TurnEvent::Repl(repl.next_event().await),
+        Phase::Running { prompt, .. } => match turn.repl.as_mut() {
+            Some(repl) => tokio::select! {
+                event = repl.next_event() => TurnEvent::Repl(event),
+                result = next_description(prompt) => TurnEvent::Description(result),
+            },
             None => std::future::pending().await,
         },
         Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
+}
+
+/// Await only the current approval's request; cancellation never queues a stale result.
+async fn next_description(prompt: &mut Option<PendingPrompt>) -> anyhow::Result<String> {
+    let Some(task) = prompt
+        .as_mut()
+        .and_then(|prompt| prompt.description.as_mut())
+        .and_then(|description| description.task.as_mut())
+    else {
+        return std::future::pending().await;
+    };
+    task.await.context("joining approval description request")?
 }
 
 /// Read terminal events on a dedicated thread. It polls with a timeout instead of
@@ -1493,5 +1602,118 @@ mod tests {
                 .eq(completed.iter().map(|block| (&block.key, &block.text)))
         );
         reply.task.abort();
+    }
+
+    /// A slow request cannot delay yes/no; abandoning the prompt cancels its owned task too.
+    #[tokio::test]
+    async fn approval_answers_do_not_wait_for_description() {
+        for answer in [Some(true), Some(false), None] {
+            let (started, ready) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = started.send(());
+                std::future::pending::<anyhow::Result<String>>().await
+            });
+            let abort = task.abort_handle();
+            ready.await.unwrap();
+            let (sender, mut receiver) = oneshot::channel();
+            let prompt = PendingPrompt {
+                operation: "operation".into(),
+                answer: sender,
+                description: Some(ApprovalDescription {
+                    task: Some(task),
+                    text: "Generating description…".into(),
+                }),
+            };
+            if let Some(answer) = answer {
+                prompt.respond(answer).unwrap();
+                assert_eq!(receiver.try_recv().unwrap(), answer);
+            } else {
+                drop(prompt);
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Completion or failure updates only ephemeral text and cannot be polled a second time.
+    #[tokio::test]
+    async fn approval_description_completion_is_display_only() {
+        for result in [
+            Ok("Lists directory contents.".to_owned()),
+            Err(anyhow::anyhow!("endpoint unavailable")),
+        ] {
+            let expected = if result.is_ok() {
+                "Description: Lists directory contents."
+            } else {
+                "Description unavailable: endpoint unavailable"
+            };
+            let (answer, _) = oneshot::channel();
+            let mut prompt = Some(PendingPrompt {
+                operation: "operation".into(),
+                answer,
+                description: Some(ApprovalDescription {
+                    task: Some(tokio::spawn(async move { result })),
+                    text: "Generating description…".into(),
+                }),
+            });
+            let result = next_description(&mut prompt).await;
+            prompt
+                .as_mut()
+                .unwrap()
+                .description
+                .as_mut()
+                .unwrap()
+                .complete(result);
+            assert!(matches!(
+                futures::poll!(Box::pin(next_description(&mut prompt))),
+                std::task::Poll::Pending
+            ));
+            let call: ToolCall = serde_json::from_value(serde_json::json!({"id":"call","type":"function","function":{"name":"REPL","arguments":"{\"code\":\"run(['ls'])\"}"}})).unwrap();
+            let messages = vec![Message {
+                role: Role::Assistant,
+                tool_calls: Some(vec![call.clone()]),
+                ..Message::default()
+            }];
+            let before = serde_json::to_value(&messages).unwrap();
+            let mut turn = Turn {
+                phase: Phase::Running {
+                    call: PendingCall {
+                        call,
+                        code: "run(['ls'])".into(),
+                    },
+                    output: String::new(),
+                    prompt,
+                },
+                queue: VecDeque::new(),
+                repl: None,
+            };
+            let blocks = build_blocks(None, &messages, &[], Some(&turn), false);
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| block.key == Key::ApprovalDescription("call".into())
+                        && block.text == expected)
+            );
+            assert!(blocks.iter().any(|block| block.text == "run(['ls'])"));
+            assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+            if let Phase::Running { prompt, .. } = &mut turn.phase {
+                prompt.take();
+            }
+            let blocks = build_blocks(None, &messages, &[], Some(&turn), false);
+            assert!(
+                !blocks
+                    .iter()
+                    .any(|block| matches!(block.key, Key::ApprovalDescription(_)))
+            );
+        }
     }
 }

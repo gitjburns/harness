@@ -33,6 +33,8 @@ pub enum Key {
     Message(usize, u8),
     /// The tool call with this id.
     Call(String, u8),
+    /// Display-only description of the pending approval for this call.
+    ApprovalDescription(String),
     /// The note at this index.
     Note(usize, u8),
 }

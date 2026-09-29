@@ -23,6 +23,8 @@ pub enum ReplEvent {
     /// Answer only this suspension; dropping the sender cancels the pending operation.
     Prompt {
         operation: String,
+        /// Only the resolved pending operation, never its enclosing REPL snippet.
+        description_input: String,
         answer: oneshot::Sender<bool>,
     },
     /// Facts for the app's persistent failure log and display-only occurrence note.

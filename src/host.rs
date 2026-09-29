@@ -85,10 +85,18 @@ impl HostContext {
     }
 
     /// Suspend the driver until this particular prompt is answered or canceled.
-    pub async fn ask(&self, operation: String) -> Result<bool, MontyException> {
+    pub async fn ask(
+        &self,
+        operation: String,
+        description_input: String,
+    ) -> Result<bool, MontyException> {
         let (answer, response) = oneshot::channel();
         self.events
-            .send(ReplEvent::Prompt { operation, answer })
+            .send(ReplEvent::Prompt {
+                operation,
+                description_input,
+                answer,
+            })
             .map_err(|_| exception(ExcType::RuntimeError, "approval canceled: the turn ended"))?;
         response
             .await
@@ -311,7 +319,10 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
         .map_err(|error| io_error("resolve command directory", &cwd, error))?;
     if !cwd.starts_with(&host.repo)
         && !host
-            .ask(format!("use command directory {}", cwd.display()))
+            .ask(
+                format!("use command directory {}", cwd.display()),
+                serde_json::json!({"operation": "use_command_directory", "directory": cwd.to_string_lossy()}).to_string(),
+            )
             .await?
     {
         return Err(host.denied(format!("run in {}: denied by the user", cwd.display())));
@@ -319,7 +330,14 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
     // Debug quoting exposes argument boundaries and escapes control characters in prompts.
     if configured.is_none()
         && !host
-            .ask(format!("{} {:?}", executable.display(), &argv[1..]))
+            .ask(
+                format!("{} {:?}", executable.display(), &argv[1..]),
+                serde_json::json!({
+                    "operation": "run_command", "executable": executable.to_string_lossy(),
+                    "arguments": &argv[1..], "working_directory": cwd.to_string_lossy(),
+                })
+                .to_string(),
+            )
             .await?
     {
         return Err(host.denied(format!(

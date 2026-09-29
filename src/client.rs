@@ -6,7 +6,7 @@ use serde_json::{Map, Number, Value, json};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::ResolvedEndpoint;
+use crate::config::{ApprovalDescriptionSettings, ResolvedEndpoint};
 
 /// The only tool the model has. Each request uses the configured description verbatim.
 fn repl_tool(tool_description: &str) -> Value {
@@ -82,6 +82,60 @@ pub fn start(
         let _ = tx.send(event);
     });
     (task, rx)
+}
+
+/// One independent request: no chat history, tool definitions, or chat prompt are sent.
+pub async fn describe_approval(
+    http: &reqwest::Client,
+    settings: &ApprovalDescriptionSettings,
+    operation: &str,
+) -> anyhow::Result<String> {
+    let response = post(
+        http,
+        &settings.endpoint,
+        &description_body(settings, operation),
+    )
+    .send()
+    .await
+    .context("requesting approval description")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("reading approval description")?;
+    if !status.is_success() {
+        bail!("description endpoint HTTP {status}: {text}");
+    }
+    let body: Value =
+        serde_json::from_str(&text).context("parsing approval description response")?;
+    description_text(&body)
+}
+
+/// Substitute the operation once; placeholder-like text in arguments stays literal.
+fn description_body(settings: &ApprovalDescriptionSettings, operation: &str) -> Value {
+    let mut body = json!({
+        "model": settings.endpoint.model,
+        "stream": false,
+        "messages": [{"role": "user", "content": settings.prompt.replace("${command}", operation)}],
+    });
+    body.as_object_mut()
+        .expect("request body is an object")
+        .extend(settings.endpoint.parameters.clone());
+    body
+}
+
+/// Empty, malformed, and endpoint-error responses are visible failures, never blank descriptions.
+fn description_text(body: &Value) -> anyhow::Result<String> {
+    if let Some(error) = body.get("error").filter(|error| !error.is_null()) {
+        bail!("description endpoint: {error}");
+    }
+    let text = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .context("description endpoint returned no text")?;
+    Ok(text.to_owned())
 }
 
 async fn stream(
@@ -232,5 +286,52 @@ fn post(
     match &endpoint.api_key {
         Some(key) => request.bearer_auth(key),
         None => request,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The request carries exactly the pending operation, independent endpoint parameters, and no tools.
+    #[test]
+    fn approval_description_request_is_independent() {
+        let settings = ApprovalDescriptionSettings {
+            endpoint: ResolvedEndpoint {
+                url: "http://description.test/v1/chat/completions".into(),
+                model: "describer".into(),
+                api_key: None,
+                parameters: json!({"temperature": 0.1}).as_object().unwrap().clone(),
+            },
+            prompt: "Describe: ${command}".into(),
+        };
+        let operation =
+            r#"{"executable":"/bin/echo","arguments":["${command}"],"working_directory":"/repo"}"#;
+        assert_eq!(
+            description_body(&settings, operation),
+            json!({
+                "model":"describer", "stream":false, "temperature":0.1,
+                "messages":[{"role":"user","content":format!("Describe: {operation}")}]
+            })
+        );
+    }
+
+    /// Endpoint errors and missing text must not look like successfully generated empty descriptions.
+    #[test]
+    fn approval_description_response_validation() {
+        assert_eq!(
+            description_text(
+                &json!({"choices":[{"message":{"content":" Explains the command. "}}]})
+            )
+            .unwrap(),
+            "Explains the command."
+        );
+        for value in [
+            json!({}),
+            json!({"choices":[{"message":{"content":" "}}]}),
+            json!({"error":{"message":"failed"}}),
+        ] {
+            assert!(description_text(&value).is_err());
+        }
     }
 }
